@@ -2,6 +2,43 @@
 
 Updated September 26, 2026 (second pass, same day). The device is now flashed, booting, on Wi-Fi, and talking to the real household speakers. The board bring-up blockers are resolved; the unproven product milestone is now audible playback.
 
+## Session 5: appliance features
+
+Built partly by four parallel Devin SWE-2 workers in Superset workspaces (queue core, artwork, power/IMU, events+OTA), then integrated and debugged on the hardware. Everything below runs on the Tab5 unless marked untested.
+
+**Now on the device.**
+- **Room layout cache.** Coordinator lookups reuse the last topology. It is dropped after grouping changes, on errors, on topology events, on wake, and every 30 s.
+- **Instant updates (UPnP GENA).** A server on port 3400 subscribes to AVTransport, RenderingControl, GroupRenderingControl and ZoneGroupTopology for the selected room and renews at half the granted 600 s. Any NOTIFY triggers an immediate refresh. Once an event proves the subscription, polling relaxes from 4 s to 15 s.
+- **Speaker traffic** per minute, steady state: about 105 calls/136 KB originally (estimated), 92/58 KB with the cache, **26/24 KB** with events. The firmware logs one `soap:` line a minute.
+- **Larger UI.** Now Playing is the first tab: 400 px artwork, 48 px title, 120x96 transport buttons, 28 px body text. A Queue tab loads around the current track and jumps to a tapped track.
+- **Artwork.** Apple Music art from `/getaa` is **PNG** (about 277 KB), decoded with LVGL's lodepng to 400x400 in about 1.4 s. JPEG uses the P4 hardware decoder but has **not been seen on hardware yet**, so its red/blue order is unverified.
+- **Screen sleep.** Dims to 15% after 60 s idle and turns the backlight off after 180 s (Kconfig `TAB5_*_SECONDS`). Both were verified on hardware. The waking touch is swallowed by a shield so it cannot press a hidden control. State polling pauses while off. A wake refetches topology and state.
+- **IMU (BMI270).** Gyro over 12 dps or accel change over 120 mg counts as activity. At rest it measures 0.2 dps / 3 mg. **Wake-by-pickup is untested** because nobody moved the device.
+- **Battery charging was off.** The BSP's Wi-Fi power-on resets I/O expander 0x44, turning CHG_EN into an input. `power_init()` restores it; the pack then charged at about 700 mA. The INA226 at 0x41 feeds a header battery indicator (percent is per-cell linear 3.30-4.15 V and reads high while charging).
+- **Signed OTA with rollback.** Partitions: nvs unchanged at 0x9000, otadata 0x10000, ota_0 0x20000, ota_1 0x510000 (4.9 MB each). The factory `human_face_det`/`storage` partitions are declared at their original offsets and untouched. Images are RSA-3072 signed without hardware secure boot, so **no eFuses were burned**. Verified: an upload lands in the other slot, boots `pending-verify`, and marks itself valid after its first successful load from the speakers. Settings survived the partition change.
+- **LVGL heap** moved from a 64 KB built-in pool to the system heap (large blocks in PSRAM).
+
+**Debugging over Wi-Fi.** Opening the USB serial port resets the Tab5, which would roll back an unconfirmed OTA image, and the USB console sometimes stalls mid-line. Use the HTTP endpoints instead: `http://<tab5>:3400/log` (last 32 KB of log), `/tasks` (task states, stack headroom, CPU), `/screenshot` (BMP). They are unauthenticated on the LAN; remove or gate them before this leaves the prototype stage.
+
+**Bugs found on hardware and fixed.**
+- 4 KB httpd stack overflow during the first OTA.
+- LVGL's lodepng returns an `lv_draw_buf_t`, not raw bytes.
+- Sonos SUBSCRIBE replies have no body length, and `esp_http_client_get_header` returns request headers, not response headers.
+- The first NOTIFY can arrive before the SID is stored.
+- The "·" glyph is missing from the built-in fonts.
+
+**Still to test with a person at the device.**
+- Picking up the Tab5 wakes it.
+- A touch on a dark screen wakes it without pressing anything.
+- The Queue tab and tapping a track.
+- A volume or track change in the Sonos app appears within a second or two.
+- Group volume, grouping and saved areas.
+- Wi-Fi recovery after a router restart.
+
+**Signing key.** `firmware/keys/ota_signing_key.pem` is gitignored and exists only on this Mac. **Back it up.** Without it, updates go back to USB.
+
+**Wi-Fi credential protection: not done, needs a decision.** The robust option (NVS encryption keyed by an HMAC eFuse key) permanently burns a key block in the chip. It is irreversible, so it was not done without the user's approval.
+
 ## Session 4: discovery fixed
 
 **Finding.** With the stored addresses erased, the session 3 SSDP code found a speaker on only 3 of 6 cold boots. When it failed, *no* speaker answered any of the three searches, even 24 s later on a retry, so the listen window was not the cause. From the Mac, multicast SSDP gets all 5 speakers every time; subnet-broadcast M-SEARCH gets none (Sonos ignores it). The gateway `192.168.68.1` on a /22 suggests a TP-Link Deco mesh. The likely cause is IGMP-snooping or multicast forwarding on the mesh dropping the Tab5's `239.255.255.250` traffic on some associations. That is a hypothesis, not proven.
@@ -97,9 +134,9 @@ Restoring the vendor defaults fixed it completely. This would have been misdiagn
 
 - **Discovery** is fixed by adding mDNS (session 4): 18 of 18 cold boots with no stored address. Keep an eye on it across more days and access-point changes; the SSDP failure's root cause on the mesh is unconfirmed.
 - SOAP `timeout_ms` is 5 s per network operation (session 3); confirm on hardware that large favorites/topology replies stay comfortably inside it.
-- Artwork is parsed but not rendered. Queue browser/editing, battery/charging, dim/sleep/wake, OTA signing/rollback, and soak testing remain.
+- Session 5 added artwork, the queue view, battery, dim/sleep/wake and signed OTA. Queue editing and soak testing remain.
 - Wi-Fi credentials live in ordinary NVS. Production credential protection remains.
-- State is polled every four seconds, not event-subscribed. Reconnect/IP-change recovery needs hardening.
+- State is event-driven with a 15 s poll fallback (session 5). Reconnect/IP-change recovery needs hardening.
 - A failed action is not retried; pending actions are dropped on error, and partial queue/grouping operations may already have happened.
 - Address `0x28` appears on the I²C bus but is in no official M5Stack I²C map. Unexplained; possibly worth reporting upstream.
 - The `CONFIG_TAB5_I2C_SCAN` diagnostic is retained; the `lvgl_port_init` and per-step probing it also does are what isolated the ordering bug.
@@ -219,7 +256,13 @@ Flash and capture logs (this unit is P4 v1.3, so use the default build):
 cd firmware/build
 python -m esptool --chip esp32p4 --port /dev/cu.usbmodem2101 write_flash \
   --flash_mode dio --flash_freq 40m --flash_size 16MB --verify \
-  0x2000 bootloader/bootloader.bin 0x10000 sonos_controller.bin 0x8000 partition_table/partition-table.bin
+  0x2000 bootloader/bootloader.bin 0x8000 partition_table/partition-table.bin \
+  0x10000 ota_data_initial.bin 0x20000 sonos_controller.bin
+```
+
+Since session 5 the app lives at **0x20000** (OTA layout). Do not use the old `0x10000 sonos_controller.bin` command: 0x10000 is now `otadata`. Day to day, prefer `bash tools/ota.sh 192.168.68.54` (no cable, keeps rollback protection). Writing only the app over USB lands in `ota_0`, and otadata may still point at `ota_1`; after a USB app flash, also write `ota_data_initial.bin` to reset it to `ota_0`.
+
+```sh
 ```
 
 esptool 4.12 wants the flash-mode flags on the `write_flash` subcommand, not before it.

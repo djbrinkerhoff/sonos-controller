@@ -6,7 +6,7 @@ A standalone, favorites-first Sonos remote. The Tab5 talks directly to speakers 
 
 This is a **hardware bring-up prototype**, not yet a finished appliance. The ESP32-P4 firmware compiles with pinned ESP-IDF 5.5.3, Tab5 BSP 1.3.1, LVGL 9.4.0 and LVGL port 2.6.2. Hardware flashing, touchscreen QA, Wi-Fi coprocessor compatibility and audible playback still need validation on the Tab5.
 
-Checkpoint verification: firmware build and partition-size check passed; 9 Python tests and 40 native C++ assertions passed. Work is paused at the user's request; see [HANDOFF.md](HANDOFF.md) before resuming.
+Running on the Tab5: Apple Music and Sonos Radio favorites, queue view, artwork, room/group volume, instant updates from the speakers, screen dim/sleep with touch and motion wake, battery indicator with charging fixed, and signed over-the-air updates with rollback. See [HANDOFF.md](HANDOFF.md) for what is verified and what still needs testing.
 
 Implemented:
 
@@ -19,7 +19,7 @@ Implemented:
 - Favorite playback replaces the queue (like the official app's "Replace Queue") and starts it. Radio favorites use their supplied stream URI/metadata. A failed operation is not automatically replayed.
 - Read-only Python compatibility probe and host tests for the shared C++ Sonos protocol code.
 
-Still to implement/validate before daily-use release: artwork rendering, queue browser/editing, screen dim/sleep/wake and battery/charging integration, signed OTA/rollback, stronger credential storage, automatic recovery after speaker IP changes, event subscriptions, layout QA on the real screen and a multi-day soak test. Wi-Fi credentials currently live in ordinary device NVS; no secrets belong in source control. The initial factory partition layout has no OTA slots.
+Still to implement/validate before daily-use release: queue editing, stronger credential storage (needs an eFuse decision), removing or gating the debug HTTP endpoints, and a multi-day soak test. Wi-Fi credentials currently live in ordinary device NVS; no secrets belong in source control. The initial factory partition layout has no OTA slots.
 
 ## Household compatibility check
 
@@ -58,11 +58,13 @@ The BSP auto-detects the supported display variants. Wi-Fi uses the internal C6 
 
 1. Connect the Tab5 USB-C device port with a data cable. Identify its serial port and P4 revision with the project environment's `python -m esptool --chip esp32p4 --port PORT chip_id`.
 2. Back up its current flash before the first write: `python -m esptool --chip esp32p4 --port PORT read_flash 0 0x1000000 artifacts/tab5-original.bin`. Run from the project root with the `.tools/espressif/python_env/.../bin` environment active. Keep that private backup.
-3. Select the matching chip-revision build, then use `bash tools/idf.sh -p PORT flash monitor` for the default build (add the same `-B`/`-D` arguments for revision 3). Follow M5Stack's download-mode instructions if needed. Do not erase flash or replace the C6 firmware as a routine step.
+3. Select the matching chip-revision build, then use `bash tools/idf.sh -p PORT flash` for the default build (it writes the bootloader, partition table, OTA data and the app at 0x20000). After that, prefer `bash tools/ota.sh <tab5-ip>` (add the same `-B`/`-D` arguments for revision 3). Follow M5Stack's download-mode instructions if needed. Do not erase flash or replace the C6 firmware as a routine step.
 4. Open Settings, enter the 2.4 GHz Wi-Fi name/password, optionally enter one Sonos speaker's IP, and connect. Select a room before tapping a favorite. The selected room's current group is the playback destination.
 5. Verify one Apple Music favorite, one Radio favorite, transport controls, room/group volume, external Sonos-app changes, saved areas, reconnect behavior, and correct touch alignment. Use a low existing speaker volume for the first playback test.
 
-Build success alone does not verify board initialization or playback. No physical device has been flashed during initial development.
+Build success alone does not verify board initialization or playback.
+
+Diagnostics over Wi-Fi (opening the USB serial port resets the device): `http://<tab5-ip>:3400/log`, `/tasks` and `/screenshot`. These are unauthenticated and meant for development.
 
 ## Over-the-air updates
 
