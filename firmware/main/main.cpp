@@ -1,5 +1,6 @@
 #include "bsp/esp-bsp.h"
 #include "network.hpp"
+#include "screen.hpp"
 #include "sonos.hpp"
 #include "esp_log.h"
 #include "nvs_flash.h"
@@ -41,6 +42,7 @@ std::string seed;
 lv_obj_t *status_label,*room_select,*favorite_list,*title_label,*artist_label,*volume_slider,*volume_label;
 lv_obj_t *ssid_input,*password_input,*seed_input,*keyboard,*join_select,*tabs,*play_button,*next_button,*prev_button,*mute_button;
 lv_obj_t *group_slider,*group_label,*area_name,*area_list;
+lv_obj_t *battery_label,*art_box,*art_image,*art_placeholder,*queue_list;
 struct Area {std::string name; std::vector<std::string> ids;};
 std::vector<Area> areas;
 bool initialized=false;
@@ -128,7 +130,7 @@ lv_obj_t* label(lv_obj_t* parent,const char* text) {
     auto obj=lv_label_create(parent); lv_label_set_text(obj,text); return obj;
 }
 lv_obj_t* button(lv_obj_t* parent,const char* text,lv_event_cb_t callback,void* data=nullptr) {
-    auto obj=lv_button_create(parent); lv_obj_set_height(obj,58);
+    auto obj=lv_button_create(parent); lv_obj_set_height(obj,76);
     lv_obj_set_style_radius(obj,14,0);
     auto l=label(obj,text); lv_obj_center(l);
     lv_obj_add_event_cb(obj,callback,LV_EVENT_CLICKED,data); return obj;
@@ -154,6 +156,39 @@ void favorite_clicked(lv_event_t* event) {
     auto index=reinterpret_cast<uintptr_t>(lv_event_get_user_data(event));
     if(selected.id.empty() || index>=favorites.size()) return;
     auto c=new Command; c->action="Favorite"; c->room=selected; c->favorite=favorites[index]; enqueue(c);
+}
+// Runs in the LVGL task. Sleep may have hidden external changes, so fetch
+// fresh topology and state straight away without a "Working..." status.
+void screen_woke() {
+    auto c=new Command; c->action="Wake"; c->room=selected;
+    if(xQueueSend(commands,&c,0)!=pdTRUE) delete c;
+}
+void queue_clicked(lv_event_t* event) {
+    if(selected.id.empty()) return;
+    auto c=new Command; c->action="QueueTrack"; c->room=selected;
+    c->value=static_cast<int>(reinterpret_cast<uintptr_t>(lv_event_get_user_data(event)));
+    enqueue(c);
+}
+void tab_changed(lv_event_t*) {
+    if(lv_tabview_get_tab_active(tabs)!=2 || selected.id.empty()) return;
+    auto c=new Command; c->action="Queue"; c->room=selected;
+    if(xQueueSend(commands,&c,0)!=pdTRUE) delete c;
+}
+void render_queue(const sonos::Room& target,const std::vector<sonos::QueueItem>& items,int total,int track) {
+    DisplayLock lock;
+    if(target.id!=selected.id) return;
+    lv_obj_clean(queue_list);
+    if(items.empty()) { label(queue_list,total?"Nothing further in the queue.":"The queue is empty. Radio and streams do not use it."); return; }
+    auto header=label(queue_list,""); lv_label_set_text_fmt(header,"%d tracks in the queue",total);
+    for(const auto& item:items) {
+        std::string text=std::to_string(item.number)+"   "+item.title+(item.artist.empty()?"":"\n       "+item.artist);
+        auto b=button(queue_list,text.c_str(),queue_clicked,reinterpret_cast<void*>(static_cast<uintptr_t>(item.number)));
+        lv_obj_set_size(b,lv_pct(100),96);
+        auto l=lv_obj_get_child(b,0); lv_obj_set_width(l,lv_pct(96)); lv_label_set_long_mode(l,LV_LABEL_LONG_DOT);
+        lv_obj_align(l,LV_ALIGN_LEFT_MID,0,0);
+        if(item.number==track) lv_obj_add_state(b,LV_STATE_CHECKED);
+        else lv_obj_set_style_bg_color(b,lv_color_hex(0x252c33),0);
+    }
 }
 void refresh_clicked(lv_event_t*) { auto c=new Command; c->action="Refresh"; enqueue(c); }
 void volume_changed(lv_event_t* event) {
@@ -206,7 +241,7 @@ void connect_clicked(lv_event_t*) {
 lv_obj_t* input(lv_obj_t* parent,const char* placeholder,bool password=false) {
     auto obj=lv_textarea_create(parent); lv_textarea_set_one_line(obj,true);
     lv_textarea_set_password_mode(obj,password); lv_textarea_set_placeholder_text(obj,placeholder);
-    lv_obj_set_width(obj,550); lv_obj_add_event_cb(obj,input_focus,LV_EVENT_FOCUSED,nullptr); return obj;
+    lv_obj_set_width(obj,720); lv_obj_add_event_cb(obj,input_focus,LV_EVENT_FOCUSED,nullptr); return obj;
 }
 void column(lv_obj_t* obj) { lv_obj_set_flex_flow(obj,LV_FLEX_FLOW_COLUMN); lv_obj_set_style_pad_row(obj,18,0); }
 void render_catalog(std::vector<sonos::Room> new_rooms,std::vector<sonos::Favorite> new_favorites) {
@@ -229,7 +264,7 @@ void render_catalog(std::vector<sonos::Room> new_rooms,std::vector<sonos::Favori
     }
     for(size_t i=0;i<favorites.size();++i) {
         auto b=button(favorite_list,(favorites[i].title+"\n"+favorites[i].provider).c_str(),favorite_clicked,reinterpret_cast<void*>(i));
-        lv_obj_set_size(b,lv_pct(100),88);
+        lv_obj_set_size(b,lv_pct(100),104);
         auto l=lv_obj_get_child(b,0); lv_obj_set_width(l,lv_pct(95)); lv_label_set_long_mode(l,LV_LABEL_LONG_DOT);
     }
 }
@@ -248,7 +283,7 @@ void render_state(const sonos::Room& target,const sonos::State& state) {
         lv_label_set_text_fmt(group_label,"Group volume · %d",state.group_volume);
     }
     lv_label_set_text(lv_obj_get_child(play_button,0),state.playback=="PLAYING"?LV_SYMBOL_PAUSE:LV_SYMBOL_PLAY);
-    lv_label_set_text(lv_obj_get_child(mute_button,0),state.muted?"Unmute":"Mute");
+    lv_label_set_text(lv_obj_get_child(mute_button,0),state.muted?LV_SYMBOL_VOLUME_MAX:LV_SYMBOL_MUTE);
     auto supports=[&](const char* action) {
         auto values=","+state.actions+",";
         return values.find(std::string(",")+action+",")!=std::string::npos;
@@ -259,50 +294,74 @@ void render_state(const sonos::Room& target,const sonos::State& state) {
 }
 void build_ui() {
     auto display=lv_display_get_default();
-    lv_display_set_theme(display,lv_theme_default_init(display,lv_palette_main(LV_PALETTE_TEAL),lv_palette_main(LV_PALETTE_GREY),true,&lv_font_montserrat_20));
+    lv_display_set_theme(display,lv_theme_default_init(display,lv_palette_main(LV_PALETTE_TEAL),lv_palette_main(LV_PALETTE_GREY),true,&lv_font_montserrat_28));
     auto screen=lv_screen_active();
     lv_obj_set_style_bg_color(screen,lv_color_hex(0x101419),0);
     lv_obj_set_style_text_color(screen,lv_color_hex(0xf2f4f6),0);
-    auto heading=label(screen,"SONOS  /  HOME"); lv_obj_align(heading,LV_ALIGN_TOP_LEFT,28,20);
-    room_select=lv_dropdown_create(screen); lv_obj_set_size(room_select,390,56);
-    lv_obj_align(room_select,LV_ALIGN_TOP_RIGHT,-28,10); lv_dropdown_set_options(room_select,"Choose a room");
+    room_select=lv_dropdown_create(screen); lv_obj_set_size(room_select,480,64);
+    lv_obj_align(room_select,LV_ALIGN_TOP_LEFT,20,12); lv_dropdown_set_options(room_select,"Choose a room");
     lv_obj_add_event_cb(room_select,room_changed,LV_EVENT_VALUE_CHANGED,nullptr);
-    tabs=lv_tabview_create(screen); lv_obj_set_size(tabs,lv_pct(100),lv_pct(82)); lv_obj_align(tabs,LV_ALIGN_TOP_MID,0,80);
-    lv_tabview_set_tab_bar_size(tabs,58);
+    battery_label=label(screen,""); lv_obj_align(battery_label,LV_ALIGN_TOP_RIGHT,-24,28);
+    tabs=lv_tabview_create(screen); lv_obj_set_size(tabs,lv_pct(100),720-88-48); lv_obj_align(tabs,LV_ALIGN_TOP_MID,0,88);
+    lv_tabview_set_tab_bar_size(tabs,72);
+    lv_obj_add_event_cb(tabs,tab_changed,LV_EVENT_VALUE_CHANGED,nullptr);
+    auto now=lv_tabview_add_tab(tabs,"Now Playing");
     auto fav=lv_tabview_add_tab(tabs,"Favorites"); column(fav);
-    auto now=lv_tabview_add_tab(tabs,"Now Playing"); column(now);
+    auto queue=lv_tabview_add_tab(tabs,"Queue"); column(queue);
     auto group=lv_tabview_add_tab(tabs,"Rooms"); column(group);
     auto setup=lv_tabview_add_tab(tabs,"Settings"); column(setup);
-    button(fav,"Refresh favorites",refresh_clicked);
-    favorite_list=lv_obj_create(fav); lv_obj_set_size(favorite_list,lv_pct(100),lv_pct(78)); column(favorite_list);
-    label(favorite_list,"Connect to Wi-Fi in Settings to find your Sonos system.");
-    title_label=label(now,"Nothing playing"); lv_obj_set_width(title_label,lv_pct(100));
-    lv_obj_set_style_text_font(title_label,&lv_font_montserrat_28,0);
-    artist_label=label(now,""); lv_obj_set_width(artist_label,lv_pct(100));
-    auto controls=lv_obj_create(now); lv_obj_set_size(controls,lv_pct(100),100); lv_obj_set_flex_flow(controls,LV_FLEX_FLOW_ROW);
-    prev_button=button(controls,LV_SYMBOL_PREV,send_action,(void*)"Previous");
-    play_button=button(controls,LV_SYMBOL_PLAY,send_action,(void*)"Toggle");
-    next_button=button(controls,LV_SYMBOL_NEXT,send_action,(void*)"Next");
-    button(controls,"Stop",send_action,(void*)"Stop");
-    mute_button=button(controls,"Mute",send_action,(void*)"Mute");
-    volume_label=label(now,"Room volume");
-    volume_slider=lv_slider_create(now); lv_obj_set_size(volume_slider,lv_pct(95),28); lv_slider_set_range(volume_slider,0,100);
+
+    // Now Playing: artwork on the left, track and controls on the right.
+    lv_obj_set_flex_flow(now,LV_FLEX_FLOW_ROW); lv_obj_set_style_pad_column(now,32,0);
+    art_box=lv_obj_create(now); lv_obj_set_size(art_box,400,400); lv_obj_remove_flag(art_box,LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_radius(art_box,18,0); lv_obj_set_style_pad_all(art_box,0,0); lv_obj_set_style_clip_corner(art_box,true,0);
+    art_placeholder=label(art_box,LV_SYMBOL_AUDIO); lv_obj_set_style_text_font(art_placeholder,&lv_font_montserrat_48,0); lv_obj_center(art_placeholder);
+    art_image=lv_image_create(art_box); lv_obj_center(art_image); lv_obj_add_flag(art_image,LV_OBJ_FLAG_HIDDEN);
+    auto info=lv_obj_create(now); lv_obj_remove_style_all(info); column(info);
+    lv_obj_set_height(info,lv_pct(100)); lv_obj_set_flex_grow(info,1); lv_obj_set_style_pad_row(info,14,0);
+    title_label=label(info,"Nothing playing"); lv_obj_set_width(title_label,lv_pct(100));
+    lv_obj_set_style_text_font(title_label,&lv_font_montserrat_48,0); lv_label_set_long_mode(title_label,LV_LABEL_LONG_DOT);
+    lv_obj_set_style_max_height(title_label,120,0);
+    artist_label=label(info,""); lv_obj_set_width(artist_label,lv_pct(100)); lv_label_set_long_mode(artist_label,LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_color(artist_label,lv_color_hex(0xaab4be),0);
+    auto controls=lv_obj_create(info); lv_obj_remove_style_all(controls); lv_obj_set_size(controls,lv_pct(100),LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(controls,LV_FLEX_FLOW_ROW); lv_obj_set_style_pad_column(controls,16,0);
+    auto transport_button=[&](const char* text,const char* action) {
+        auto b=button(controls,text,send_action,(void*)action); lv_obj_set_size(b,120,96);
+        lv_obj_set_style_text_font(lv_obj_get_child(b,0),&lv_font_montserrat_36,0); return b;
+    };
+    prev_button=transport_button(LV_SYMBOL_PREV,"Previous");
+    play_button=transport_button(LV_SYMBOL_PLAY,"Toggle");
+    next_button=transport_button(LV_SYMBOL_NEXT,"Next");
+    transport_button(LV_SYMBOL_STOP,"Stop");
+    mute_button=transport_button(LV_SYMBOL_MUTE,"Mute");
+    volume_label=label(info,"Room volume");
+    volume_slider=lv_slider_create(info); lv_obj_set_size(volume_slider,lv_pct(92),32); lv_slider_set_range(volume_slider,0,100);
     lv_obj_add_event_cb(volume_slider,volume_changed,LV_EVENT_VALUE_CHANGED,nullptr);
     lv_obj_add_event_cb(volume_slider,volume_changed,LV_EVENT_RELEASED,nullptr);
-    group_label=label(now,"Group volume");
-    group_slider=lv_slider_create(now); lv_obj_set_size(group_slider,lv_pct(95),28); lv_slider_set_range(group_slider,0,100);
+    group_label=label(info,"Group volume");
+    group_slider=lv_slider_create(info); lv_obj_set_size(group_slider,lv_pct(92),32); lv_slider_set_range(group_slider,0,100);
     lv_obj_add_event_cb(group_slider,group_volume_changed,LV_EVENT_VALUE_CHANGED,nullptr);
     lv_obj_add_event_cb(group_slider,group_volume_changed,LV_EVENT_RELEASED,nullptr);
-    auto info=label(group,"The room selected above will join the destination below.\nJoining changes what plays in that room; the destination keeps playing."); lv_obj_set_width(info,lv_pct(100));
-    join_select=lv_dropdown_create(group); lv_obj_set_width(join_select,500); lv_dropdown_set_options(join_select,"Choose destination");
+
+    button(fav,"Refresh favorites",refresh_clicked);
+    favorite_list=lv_obj_create(fav); lv_obj_set_size(favorite_list,lv_pct(100),LV_SIZE_CONTENT); column(favorite_list);
+    label(favorite_list,"Connect to Wi-Fi in Settings to find your Sonos system.");
+
+    queue_list=lv_obj_create(queue); lv_obj_set_size(queue_list,lv_pct(100),LV_SIZE_CONTENT); column(queue_list);
+    label(queue_list,"Open this tab while music is playing to see what's next.");
+
+    auto group_info=label(group,"The room selected above will join the destination below.\nJoining changes what plays in that room; the destination keeps playing."); lv_obj_set_width(group_info,lv_pct(100));
+    join_select=lv_dropdown_create(group); lv_obj_set_width(join_select,560); lv_dropdown_set_options(join_select,"Choose destination");
     button(group,"Join selected room to destination",group_clicked,(void*)"Join");
     button(group,"Ungroup selected room",group_clicked,(void*)"Ungroup");
     button(group,"Refresh rooms",refresh_clicked);
     auto area_info=label(group,"Save the selected room's current group as an area.\nApplying an area regroups its rooms and can interrupt their current music."); lv_obj_set_width(area_info,lv_pct(100));
     area_name=input(group,"Area name, e.g. Downstairs"); lv_textarea_set_max_length(area_name,32);
     button(group,"Save current group as area",area_save_clicked);
-    area_list=lv_obj_create(group); lv_obj_set_size(area_list,lv_pct(100),240); column(area_list);
+    area_list=lv_obj_create(group); lv_obj_set_size(area_list,lv_pct(100),LV_SIZE_CONTENT); column(area_list);
     load_areas(); render_areas();
+
     ssid_input=input(setup,"Wi-Fi name (2.4 GHz)"); lv_textarea_set_max_length(ssid_input,32);
     password_input=input(setup,"Wi-Fi password",true); lv_textarea_set_max_length(password_input,63);
     seed_input=input(setup,"Optional Sonos speaker IP"); lv_textarea_set_max_length(seed_input,15);
@@ -312,12 +371,14 @@ void build_ui() {
     lv_textarea_set_text(seed_input,setting("seed").c_str());
     button(setup,"Connect & save",connect_clicked);
     label(setup,"Prototype · standalone · Apple Music + Sonos Radio favorites");
-    status_label=label(screen,"Starting..."); lv_obj_set_width(status_label,lv_pct(95)); lv_obj_align(status_label,LV_ALIGN_BOTTOM_LEFT,28,-10);
+
+    status_label=label(screen,"Starting..."); lv_obj_set_width(status_label,lv_pct(95)); lv_obj_align(status_label,LV_ALIGN_BOTTOM_LEFT,24,-8);
+    lv_obj_set_style_text_font(status_label,&lv_font_montserrat_22,0);
     lv_label_set_long_mode(status_label,LV_LABEL_LONG_DOT);
     keyboard=lv_keyboard_create(screen); lv_obj_set_size(keyboard,lv_pct(100),lv_pct(44)); lv_obj_add_flag(keyboard,LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_event_cb(keyboard,[](lv_event_t*){lv_obj_add_flag(keyboard,LV_OBJ_FLAG_HIDDEN);},LV_EVENT_READY,nullptr);
     lv_obj_add_event_cb(keyboard,[](lv_event_t*){lv_obj_add_flag(keyboard,LV_OBJ_FLAG_HIDDEN);},LV_EVENT_CANCEL,nullptr);
-    if(setting("ssid").empty()) lv_tabview_set_active(tabs,3,LV_ANIM_OFF);
+    if(setting("ssid").empty()) lv_tabview_set_active(tabs,4,LV_ANIM_OFF);
 }
 void refresh() {
     if(!network_online()) throw std::runtime_error("Wi-Fi is disconnected");
@@ -352,6 +413,7 @@ void worker(void*) {
     if(!boot->ssid.empty()) { if(xQueueSend(commands,&boot,0)!=pdTRUE) delete boot; }
     else { delete boot; status(storage_ok?"Open Settings to connect to your home Wi-Fi.":"Settings storage failed; settings will not be saved. Open Settings to connect."); }
     TickType_t last_catalog_attempt=0, last_topology=0;
+    int queue_track=-1; std::string queue_room; // what the Queue tab currently shows
     for(;;) {
         Command* raw=nullptr;
         xQueueReceive(commands,&raw,pdMS_TO_TICKS(4000));
@@ -382,15 +444,29 @@ void worker(void*) {
                 else if(c->action=="Mute") client.mute(c->room,c->value);
                 else if(c->action=="Join") {client.join(c->room,c->destination); refresh();}
                 else if(c->action=="Ungroup") {client.ungroup(c->room); refresh();}
+                else if(c->action=="Wake") client.invalidate_topology();
+                else if(c->action=="Queue") queue_track=-1;
+                else if(c->action=="QueueTrack") { client.play_queue_track(c->room,c->value); queue_track=-1; }
                 else if(c->action!="Poll") client.transport(c->room,c->action);
             }
             // External regrouping is picked up within 30 s even without events.
             if(xTaskGetTickCount()-last_topology>pdMS_TO_TICKS(30000)) {
                 client.invalidate_topology(); last_topology=xTaskGetTickCount();
             }
+            if(!c && screen_off()) continue; // nobody is looking; save the speakers the traffic
             sonos::Room target;
             {DisplayLock lock; target=selected;}
-            if(!target.id.empty()) render_state(target,client.state(target));
+            if(target.id.empty()) continue;
+            const auto state=client.state(target);
+            render_state(target,state);
+            bool queue_visible; {DisplayLock lock; queue_visible=lv_tabview_get_tab_active(tabs)==2;}
+            if(queue_visible && (state.track!=queue_track || target.id!=queue_room)) {
+                // Show a window from just before the current track onwards.
+                int total=0; const int start=std::max(0,state.track-3);
+                auto items=client.queue(target,start,50,&total);
+                render_queue(target,items,total,state.track);
+                queue_track=state.track; queue_room=target.id;
+            }
         } catch(const std::exception& e) {
             // Drop queued actions after any failure; never replay a possibly completed queue mutation.
             Command* pending=nullptr;
@@ -533,6 +609,7 @@ extern "C" void app_main() {
         DisplayLock lock;
         lv_display_set_rotation(display,LV_DISPLAY_ROTATION_90);
         build_ui();
+        screen_init(screen_woke);
     }
     if(xTaskCreate(worker,"sonos",24576,nullptr,4,nullptr)!=pdPASS) status("Unable to start controller task");
 }

@@ -1,3 +1,25 @@
+menu "Tab5 screen"
+
+config TAB5_DIM_SECONDS
+    int "Dim the screen after this many idle seconds"
+    default 60
+    range 5 3600
+
+config TAB5_OFF_SECONDS
+    int "Turn the backlight off after this many idle seconds"
+    default 180
+    range 10 86400
+    help
+        Idle means no touch and no motion from the IMU. Music keeps playing;
+        state polling pauses while the backlight is off.
+
+config TAB5_DIM_PERCENT
+    int "Dimmed brightness percent"
+    default 15
+    range 1 100
+
+endmenu
+
 menu "Tab5 bring-up diagnostics"
 
 config TAB5_I2C_SCAN

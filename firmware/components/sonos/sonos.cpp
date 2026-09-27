@@ -270,7 +270,7 @@ State Client::state(const Room& room) {
     s.playback=t["CurrentTransportState"]; s.actions=a["Actions"];
     s.volume=number(v.at("CurrentVolume"),100); s.muted=m["CurrentMute"]=="1";
     s.group_volume=number(g.at("CurrentVolume"),100);
-    s.track=p["Track"].empty() ? 0 : number(p["Track"]);
+    try { s.track=p["Track"].empty() ? 0 : number(p["Track"]); } catch (...) { s.track=0; } // e.g. NOT_IMPLEMENTED
     if (!p["TrackMetaData"].empty() && p["TrackMetaData"]!="NOT_IMPLEMENTED") {
         tinyxml2::XMLDocument doc; parse(doc,p["TrackMetaData"]);
         s.title=text(descendant(doc.RootElement(),"title"));
