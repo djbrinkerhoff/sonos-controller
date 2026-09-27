@@ -1,0 +1,12 @@
+.tools/
+.venv/
+artifacts/
+firmware/build/
+firmware/build-rev3/
+firmware/sdkconfig.rev3.local*
+firmware/managed_components/
+firmware/sdkconfig
+firmware/sdkconfig.old
+__pycache__/
+*.pyc
+.DS_Store
