@@ -1,6 +1,7 @@
 #include "bsp/esp-bsp.h"
 #include "network.hpp"
 #include "screen.hpp"
+#include "power.hpp"
 #include "sonos.hpp"
 #include "esp_log.h"
 #include "nvs_flash.h"
@@ -268,6 +269,13 @@ void render_catalog(std::vector<sonos::Room> new_rooms,std::vector<sonos::Favori
         auto l=lv_obj_get_child(b,0); lv_obj_set_width(l,lv_pct(95)); lv_label_set_long_mode(l,LV_LABEL_LONG_DOT);
     }
 }
+void render_battery(const Battery& battery) {
+    DisplayLock lock;
+    if(!battery.present) { lv_label_set_text(battery_label,LV_SYMBOL_USB); return; }
+    const char* symbol=battery.percent>85?LV_SYMBOL_BATTERY_FULL:battery.percent>60?LV_SYMBOL_BATTERY_3:
+                       battery.percent>35?LV_SYMBOL_BATTERY_2:battery.percent>10?LV_SYMBOL_BATTERY_1:LV_SYMBOL_BATTERY_EMPTY;
+    lv_label_set_text_fmt(battery_label,"%s%s %d%%",battery.charging?LV_SYMBOL_CHARGE " ":"",symbol,battery.percent);
+}
 void render_state(const sonos::Room& target,const sonos::State& state) {
     DisplayLock lock;
     if(target.id!=selected.id) return;
@@ -405,6 +413,8 @@ void refresh() {
 void worker(void*) {
     try {
         if(bsp_feature_enable(BSP_FEATURE_WIFI,true)!=ESP_OK) throw std::runtime_error("Cannot power the Wi-Fi module");
+        power_init(); // must follow the Wi-Fi power-on, which resets the charger pins
+        motion_start(screen_note_motion);
         vTaskDelay(pdMS_TO_TICKS(300));
         network_init(); initialized=true;
     }
@@ -412,7 +422,7 @@ void worker(void*) {
     auto boot=new Command; boot->action="Connect"; boot->ssid=setting("ssid"); boot->password=setting("password"); boot->seed=setting("seed");
     if(!boot->ssid.empty()) { if(xQueueSend(commands,&boot,0)!=pdTRUE) delete boot; }
     else { delete boot; status(storage_ok?"Open Settings to connect to your home Wi-Fi.":"Settings storage failed; settings will not be saved. Open Settings to connect."); }
-    TickType_t last_catalog_attempt=0, last_topology=0;
+    TickType_t last_catalog_attempt=0, last_topology=0, last_battery=0;
     int queue_track=-1; std::string queue_room; // what the Queue tab currently shows
     for(;;) {
         Command* raw=nullptr;
@@ -448,6 +458,13 @@ void worker(void*) {
                 else if(c->action=="Queue") queue_track=-1;
                 else if(c->action=="QueueTrack") { client.play_queue_track(c->room,c->value); queue_track=-1; }
                 else if(c->action!="Poll") client.transport(c->room,c->action);
+            }
+            if(!last_battery || xTaskGetTickCount()-last_battery>pdMS_TO_TICKS(30000)) {
+                last_battery=xTaskGetTickCount();
+                const auto battery=battery_read();
+                render_battery(battery);
+                ESP_LOGI(TAG,"Battery: %s %d mV %d%% %d mA%s",battery.present?"present":"absent",battery.pack_mv,
+                         battery.percent,battery.current_ma,battery.charging?" charging":"");
             }
             // External regrouping is picked up within 30 s even without events.
             if(xTaskGetTickCount()-last_topology>pdMS_TO_TICKS(30000)) {
