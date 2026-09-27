@@ -2,9 +2,9 @@
 
 Updated September 26, 2026 (second pass, same day). The device is now flashed, booting, on Wi-Fi, and talking to the real household speakers. The board bring-up blockers are resolved; the unproven product milestone is now audible playback.
 
-## Session 3: review fixes (not yet flashed)
+## Session 3: review fixes
 
-Code review changes, built and host-tested but **not yet run on the Tab5**:
+Code review changes, committed as `6718ff7` and flashed to the Tab5 (P4 v1.3, default build):
 
 - **Speaker fallback.** Every visible room IP from the last good topology is saved to NVS (`speakers` key). `refresh()` tries the current seed, the manual seed, then each saved IP (each behind a bounded 1.5 s TCP check), and only then SSDP. A stale or powered-off seed no longer strands the controller.
 - **SSDP** now listens against one 4 s deadline with `MX: 2` and three spaced sends, instead of quitting at the first quiet second. Wi-Fi power save is disabled (`WIFI_PS_NONE`) as a suspected cause of missed replies; revisit with battery/sleep work. Discovery logs the time and number of sends it took.
@@ -16,7 +16,13 @@ Code review changes, built and host-tested but **not yet run on the Tab5**:
 - **`apply_area`** no longer re-sends a join to rooms already in the kept group.
 - **Tests:** 67 native assertions (was 40), adding join/ungroup, saved areas against a simulated household, group volume, radio playback and `state()`.
 
-To verify on hardware: cold boot with the `seed` key cleared, SSDP timing in the log, Wi-Fi recovery after an access-point restart, replace-queue behavior, and saved areas.
+Hardware results after flashing:
+
+- Clean single boot, ST7121 detected, DHCP lease about 10 s after reset; no errors or warnings logged. `WIFI_PS_NONE` was accepted by the C6.
+- The `speakers` NVS key was written with all 5 room IPs (checked by reading the NVS partition; the dump was deleted because it also holds the Wi-Fi password).
+- **Passed (user-confirmed):** rooms and favorites load, favorite playback replaces the queue, and the Sonos Radio favorite ("Set The Table") plays.
+- **Not tested, by user choice for now:** group volume, grouping, saved areas, and Wi-Fi recovery after a router restart.
+- **Not tested:** SSDP discovery. With a working seed and 5 saved IPs it is never reached; testing it means erasing the `seed` and `speakers` keys, which needs the user's approval.
 
 ## Session 2: hardware bring-up (what changed)
 
@@ -61,7 +67,7 @@ Restoring the vendor defaults fixed it completely. This would have been misdiagn
 - SSDP auto-discovery: **intermittent** — found a speaker on one boot, none on the next. Manual-IP path works reliably.
 - SOAP against a real speaker (`ListAvailableServices`, topology, favorites): **passed** with zero errors over a 110 s run at the raised timeout.
 - Audible playback: **passed.** User confirmed audio plays, pauses, and responds to volume up/down on a real Apple Music favorite. This retires the central architectural risk in `PLAN.md` — Sonos does play Apple Music content from a preserved favorite URI, so the favorites-first scope is viable.
-- Room/group volume, grouping/ungrouping, saved areas, queue viewing, external changes from the official app, and the Sonos Radio favorite ("Set The Table"): **still not performed.**
+- Room/group volume, grouping/ungrouping, saved areas, queue viewing, and external changes from the official app: **still not performed.** The Sonos Radio favorite passed in session 3.
 
 ## Open items
 
@@ -172,7 +178,7 @@ Build log: `artifacts/firmware-build.log`. Some local incremental builds can run
 ## Exact next steps when the user resumes
 
 1. Read this handoff. Inspect current files before changing anything; agents share this directory.
-2. **Finish the playback validation matrix.** Apple Music favorites are proven; still untested are the Sonos Radio favorite ("Set The Table"), room/group volume, grouping/ungrouping, saved areas, queue viewing, and whether external changes made in the official app are reflected. Test every speaker model actually present, not just the one used so far.
+2. **Finish the playback validation matrix.** Apple Music favorites are proven; Sonos Radio and replace-queue passed in session 3; still untested are room/group volume, grouping/ungrouping, saved areas, queue viewing, and whether external changes made in the official app are reflected. Test every speaker model actually present, not just the one used so far.
 3. **Confirm SSDP auto-discovery on hardware** after the session 3 changes. It was intermittent. Playback currently depends on a seeded manual IP, so the product does not yet work from a cold boot with no stored address; that address also goes stale if the router reassigns it. Clear the `seed` key from NVS once discovery is reliable.
 4. Fix any board/protocol issues observed before expanding UI/features. Then finish the appliance work listed above.
 
@@ -213,7 +219,7 @@ Verified results: the legacy-P4 firmware build, 40 passing native assertions, 9 
 
 That last item is the significant one. `PLAN.md` selected the favorites-first standalone architecture on the condition that Apple Music playback could be proven, and warned against assuming any Apple Music item is directly playable by Sonos. It is proven for favorites. The saved private report contains 17 `allowed_favorites`.
 
-Still unproven: the Sonos Radio favorite, grouping, saved areas, queue viewing, reflection of external changes, and every speaker model in the household. Also note all playback so far was driven by a **seeded manual IP**; SSDP discovery remains unreliable, so the product does not yet work from a cold boot with no stored address.
+Still unproven: grouping, saved areas, queue viewing, reflection of external changes, and every speaker model in the household. Also note all playback so far was driven by a **seeded manual IP**; SSDP discovery remains unreliable, so the product does not yet work from a cold boot with no stored address.
 
 A backup of the device's original flash exists at `artifacts/tab5-original.bin` and should be preserved. To return the Tab5 to factory firmware, write that image back and reset.
 
