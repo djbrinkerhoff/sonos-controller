@@ -8,6 +8,15 @@
 
 enum class View { NowPlaying, Favorites, Queue, Rooms, Settings };
 
+// Artwork geometry. The worker prepares covers at exactly these sizes with the
+// corners pre-rounded, so drawing them is a plain copy: scaling or clipping
+// images in LVGL costs about a second per full-screen frame on this device.
+namespace art_spec {
+constexpr uint32_t now_side=480, now_radius=24;
+constexpr uint32_t tile_side=195, tile_radius=16;
+constexpr uint32_t background=0x0F1216;  // the view background behind covers
+}
+
 void ui_build();
 void ui_show(View view);
 View ui_view();

@@ -16,11 +16,14 @@ struct Artwork {
     Artwork& operator=(const Artwork&) = delete;
 };
 
-// Downloads the image and decodes it to RGB565 scaled down to fit inside
-// max_side x max_side (aspect preserved, never upscaled). Throws
-// std::runtime_error on any failure: bad URI, network, oversized body,
+// Downloads the image and returns exactly side x side RGB565 pixels: centre
+// cropped, resampled, and with corners of corner_radius already rounded
+// against background (0xRRGGBB). The UI can then draw it as a plain
+// unscaled rectangle, which is far cheaper than scaling or clipping per frame.
+// Throws std::runtime_error on any failure: bad URI, network, oversized body,
 // unsupported format, or decode error.
-Artwork fetch_artwork(const std::string& speaker_ip, const std::string& art_uri, uint32_t max_side);
+Artwork fetch_artwork(const std::string& speaker_ip, const std::string& art_uri, uint32_t side,
+                      uint32_t corner_radius = 0, uint32_t background = 0);
 
 // Resolves a Sonos albumArtURI to an absolute URL. Exposed for testing.
 std::string artwork_url(const std::string& speaker_ip, const std::string& art_uri);

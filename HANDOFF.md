@@ -2,6 +2,48 @@
 
 Updated September 26, 2026 (second pass, same day). The device is now flashed, booting, on Wi-Fi, and talking to the real household speakers. The board bring-up blockers are resolved; the unproven product milestone is now audible playback.
 
+## Session 7: UI performance
+
+The user reported that the Playing and Favorites views drew slowly, in a visible top-to-bottom wipe. Measured with new instrumentation:
+- `/perf`: per-frame render time, number of flushed bands, flush time, DMA heap, and a lost-completion counter.
+- `/tap` and `/drag`: a virtual pointer. A press lasts a number of LVGL reads rather than a fixed time, so it cannot be missed.
+- `/panel`: the real DPI framebuffer, not LVGL's render, which is how flush bugs are caught.
+- `/profile`: LVGL's built-in profiler. It is compiled in only when `CONFIG_LV_USE_PROFILER` is set.
+
+Numbers are milliseconds from finger release to the finished view, as measured by the scratch scripts `bench.sh` and `scroll.sh`, which tap the rail and drag the lists over HTTP.
+
+| | Start | Final |
+|---|---|---|
+| Favorites | 1,710 (one 1,618 ms frame) | 47 |
+| Playing | 1,070 (965 ms frame) | 40 |
+| Settings | 165 | 36 |
+| Rooms / Queue view | ~120 / ~66 frame | 33-37 / 17-25 frame |
+| Press highlight (after LVGL sees the touch) | 7-46 | 3-5 |
+| Scrolling Favorites / Queue | ~16 / ~24 fps | ~20 / ~40 fps |
+
+Real touches are interrupt-driven on the ST7121 (event-mode input), so no polling delay is added on top.
+
+**What worked, in order of effect:**
+1. **Covers prepared off-thread at exactly their drawn size, with corners pre-rounded** into the view background (`art_spec` in `ui.hpp`, `fetch_artwork(side, radius, background)`). Scaling images in LVGL, and clipping them to rounded corners, cost 0.9-1.5 s per full frame.
+2. **`-O2`** instead of `-Og`: about -30%.
+3. **PPA rotation directly into the panel framebuffer** (`fast_flush.cpp`). The port's flush did a blocking PPA rotate into its own buffer, then a DMA2D copy; flush time went from 14.4 to about 3 ms per frame. The panel handle is read from esp_lvgl_port 2.6's private display context and verified via `esp_lcd_dpi_panel_get_frame_buffer`; if that fails, the port's flush is kept.
+4. **Overdraw removal:** transparent card and frame backgrounds under covers.
+5. **80 MHz flash** (M5Stack's factory setting, DIO) instead of 40 MHz; needs minimum chip revision v1.0.
+6. **16 ms refresh period**, so frames that render in under 33 ms are no longer capped at 30 fps.
+
+**Measured and rejected:**
+- Two LVGL draw units: no gain, and cost about 30 KB of internal RAM.
+- 120-line bands: failed to allocate, and rollback caught it.
+- A single 100-line band: no gain, and TLS failed at 24 KB free internal DMA memory.
+- A full-screen PSRAM draw buffer: 154 ms vs 69 ms.
+- LVGL's PPA draw unit: needs a patched managed component and 64-byte buffer alignment, and in 9.4 its image rule only accepts *non*-opaque images.
+
+**Bug found and fixed:** with the direct flush, LVGL busy-waited for the PPA completion interrupt. During an OTA flash write one never arrived, and the spin starved CPU 0 (task watchdog, HTTP server hung). The wait now blocks on a semaphore with a 50 ms timeout (`lost PPA completions` in `/perf`, 0 in normal use). Verified with three OTA uploads during continuous scrolling.
+
+mbedTLS now allocates from PSRAM (`CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC`). Internal DMA memory at rest went from 35 to 56 KB free, and TLS for artwork had failed at 24 KB.
+
+**Remaining cost:** scrolling Favorites is about 20 fps. Each frame copies ten 195 px covers out of PSRAM (about 16 ms of cache misses), and LVGL walks the widget tree once per band (about 12 ms). The next lever would be hardware image copies (a custom PPA/DMA2D draw path).
+
 ## Session 6: design pass
 
 The UI was redesigned over three passes. Each pass was deployed over the air and checked with `/screenshot`, using the new `/ui?view=0..4` endpoint to switch views remotely.
@@ -230,7 +272,7 @@ The BSP supports ILI9881C/GT911, ST7123 and ST7121 through touch-controller dete
 
 C6 power: `bsp_feature_enable(BSP_FEATURE_WIFI, true)` before remote Wi-Fi initialization. Hosted SDIO pins: reset 15, CLK 12, CMD 13, D0 11, D1 10, D2 9, D3 8. Host clock is **40 MHz with receive streaming mode enabled** — these are the component's own defaults and must not be reduced. An earlier 25 MHz / `SDIO_OPTIMIZATION_RX_NONE` setting silently truncated SOAP responses; see session 2 above. Do not overwrite the factory C6 firmware routinely.
 
-**P4 chip revision is a mandatory pre-flash check.** IDF 5.5.3 defaults to revision 3.1, which cannot run on earlier chips. The default build deliberately targets P4 **0.x/1.x**, using `ESP32P4_SELECTS_REV_LESS_V3=y` and minimum revision 0.0. This unit is **v1.3**, verified on hardware, so the default build is correct. Revision 3.x needs a separate build using `sdkconfig.rev3`. Chip revision and LCD driver revision are different facts.
+**P4 chip revision is a mandatory pre-flash check.** IDF 5.5.3 defaults to revision 3.1, which cannot run on earlier chips. The default build deliberately targets P4 **1.x**, using `ESP32P4_SELECTS_REV_LESS_V3=y` and minimum revision **1.0** (session 7: IDF only allows 80 MHz flash above rev 0.x). This unit is **v1.3**, verified on hardware, so the default build is correct. Revision 3.x needs a separate build using `sdkconfig.rev3`. Chip revision and LCD driver revision are different facts.
 
 The current default firmware build produces `firmware/build/sonos_controller.bin`, size `0x19be60` bytes (about 1.62 MiB), with 77% of the 7 MiB application partition free. Associated bootloader, partition table and flash arguments are in the same build directory. This is a prototype factory partition layout, without OTA slots. A separate scan build lives in `firmware/build-scan/` via `firmware/sdkconfig.scan`.
 
@@ -278,7 +320,7 @@ Flash and capture logs (this unit is P4 v1.3, so use the default build):
 ```sh
 cd firmware/build
 python -m esptool --chip esp32p4 --port /dev/cu.usbmodem2101 write_flash \
-  --flash_mode dio --flash_freq 40m --flash_size 16MB --verify \
+  --flash_mode dio --flash_freq 80m --flash_size 16MB --verify \
   0x2000 bootloader/bootloader.bin 0x8000 partition_table/partition-table.bin \
   0x10000 ota_data_initial.bin 0x20000 sonos_controller.bin
 ```

@@ -101,7 +101,7 @@ struct ArtFrame {
         side=size;
         frame=div(parent); lv_obj_set_size(frame,size,size);
         lv_obj_set_style_bg_opa(frame,LV_OPA_COVER,0); lv_obj_set_style_bg_color(frame,c(ink::raised),0);
-        lv_obj_set_style_radius(frame,radius,0); lv_obj_set_style_clip_corner(frame,true,0);
+        lv_obj_set_style_radius(frame,radius,0);  // no clip_corner: covers arrive pre-rounded
         placeholder=text(frame,size>=240?&font_icons_52:&font_body_32,ink::faint,icon); lv_obj_center(placeholder);
         image=lv_image_create(frame); lv_obj_center(image); lv_obj_add_flag(image,LV_OBJ_FLAG_EVENT_BUBBLE);
         lv_obj_add_flag(image,LV_OBJ_FLAG_HIDDEN);
@@ -112,12 +112,9 @@ struct ArtFrame {
         art=std::move(next);
         if(art.pixels) show_image(image,dsc,art);
         const bool shown=art.pixels!=nullptr;
-        if(shown) {
-            // Cover the frame (crop, never letterbox); the frame clips the overflow.
-            const uint32_t shortest=std::min(art.width,art.height);
-            lv_image_set_scale(image,shortest==static_cast<uint32_t>(side)?256:side*256/shortest);
-            lv_obj_center(image);
-        }
+        if(shown) lv_obj_center(image);  // arrives at exactly side x side, drawn unscaled
+        // The cover hides the frame entirely; drawing its fill underneath is wasted work.
+        lv_obj_set_style_bg_opa(frame,shown?LV_OPA_TRANSP:LV_OPA_COVER,0);
         lv_obj_set_flag(image,LV_OBJ_FLAG_HIDDEN,!shown);
         lv_obj_set_flag(placeholder,LV_OBJ_FLAG_HIDDEN,shown);
     }
@@ -269,7 +266,7 @@ void render_now_playing() {
     render_progress();
 }
 void build_now_playing(lv_obj_t* v) {
-    now_art.build(v,480,24,LV_SYMBOL_AUDIO);
+    now_art.build(v,art_spec::now_side,art_spec::now_radius,LV_SYMBOL_AUDIO);
     lv_obj_align(now_art.frame,LV_ALIGN_LEFT_MID,PAD,0);
     const int x=PAD+480+56, width=CONTENT_W-x-PAD;
     auto info=column(v,0); lv_obj_set_size(info,width,480); lv_obj_align(info,LV_ALIGN_LEFT_MID,x,0);
@@ -329,13 +326,16 @@ void render_favorites() {
         lv_obj_set_width(l,CONTENT_W-2*PAD);
         return;
     }
-    constexpr int columns=5, gap=24, tile=(CONTENT_W-2*PAD-(columns-1)*gap)/columns;
+    constexpr int columns=5, gap=24, tile=art_spec::tile_side;
+    static_assert(columns*tile+(columns-1)*gap<=CONTENT_W-2*PAD,"favorite tiles must fit the grid");
     for(size_t i=0;i<favorites.size();++i) {
         const auto& f=favorites[i];
         auto card=tappable(fav_grid,tile,LV_SIZE_CONTENT,ink::bg,ink::surface,20,favorite_clicked,reinterpret_cast<void*>(i));
+        lv_obj_set_style_bg_opa(card,LV_OPA_TRANSP,0);  // same colour as the view; only pressed needs a fill
+        lv_obj_set_style_bg_opa(card,LV_OPA_COVER,LV_STATE_PRESSED);
         lv_obj_set_flex_flow(card,LV_FLEX_FLOW_COLUMN); lv_obj_set_style_pad_row(card,8,0); lv_obj_set_style_pad_bottom(card,8,0);
         auto& t=tiles[f.id+"#"+std::to_string(i)];
-        t.art.build(card,tile,16,f.radio?ICON_RADIO:LV_SYMBOL_AUDIO);
+        t.art.build(card,tile,art_spec::tile_radius,f.radio?ICON_RADIO:LV_SYMBOL_AUDIO);
         // Two lines of title at a fixed height keep every row of tiles aligned.
         auto title=text(card,&font_body_26,ink::text,f.title.c_str());
         lv_obj_set_size(title,tile,72); lv_label_set_long_mode(title,LV_LABEL_LONG_DOT);
@@ -669,6 +669,7 @@ void ui_queue(const sonos::Room& room,const std::vector<sonos::QueueItem>& items
     for(const auto& item:items) {
         const bool now=item.number==track;
         auto r=tappable(queue_list,CONTENT_W-2*PAD,96,now?ink::surface:ink::bg,ink::pressed,16,queue_clicked,reinterpret_cast<void*>(static_cast<uintptr_t>(item.number)));
+        if(!now) { lv_obj_set_style_bg_opa(r,LV_OPA_TRANSP,0); lv_obj_set_style_bg_opa(r,LV_OPA_COVER,LV_STATE_PRESSED); }
         lv_obj_set_style_pad_hor(r,24,0);
         auto n=text(r,&font_caption_22,now?ink::accent:ink::faint,now?LV_SYMBOL_PLAY:std::to_string(item.number).c_str());
         lv_obj_set_width(n,64); lv_obj_align(n,LV_ALIGN_LEFT_MID,0,0);

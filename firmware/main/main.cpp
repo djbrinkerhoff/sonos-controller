@@ -5,6 +5,7 @@
 #include "artwork.hpp"
 #include "app.hpp"
 #include "ui.hpp"
+#include "fast_flush.hpp"
 #include "events.hpp"
 #include "ota.hpp"
 #include "debug.hpp"
@@ -239,7 +240,7 @@ void worker(void*) {
                     if(retry) thumbnail_retries.pop_back();
                     const auto& f=favorites[index];
                     Artwork art;
-                    if(!f.art.empty()) try { art=fetch_artwork(seed,thumbnail_url(f.art),198); }
+                    if(!f.art.empty()) try { art=fetch_artwork(seed,thumbnail_url(f.art),art_spec::tile_side,art_spec::tile_radius,art_spec::background); }
                     catch(const std::exception& e) {
                         ESP_LOGW(TAG,"Favorite art for %s: %s",f.title.c_str(),e.what());
                         if(!retry) thumbnail_retries.push_back(index);
@@ -261,7 +262,7 @@ void worker(void*) {
             if(state.art!=art_uri || target.id!=art_room) {
                 art_uri=state.art; art_room=target.id;
                 Artwork art;
-                if(!state.art.empty()) try { art=fetch_artwork(target.ip,state.art,480); }
+                if(!state.art.empty()) try { art=fetch_artwork(target.ip,state.art,art_spec::now_side,art_spec::now_radius,art_spec::background); }
                 catch(const std::exception& e) { ESP_LOGW(TAG,"Artwork unavailable: %s",e.what()); }
                 ui_artwork(target,std::move(art));
             }
@@ -437,6 +438,9 @@ extern "C" void app_main() {
 #endif
     ota_log_boot();
     await_touch_controller();
+    // Measured: a full-screen PSRAM draw buffer (one band) renders Favorites in
+    // ~154 ms versus ~69 ms for the BSP's 50-line bands in internal RAM, so the
+    // default stays. Pixel throughput, not per-band overhead, is the cost here.
     auto display=bsp_display_start();
     if(!display) {ESP_LOGE(TAG,"Display initialization failed");return;}
     bsp_display_backlight_on();
@@ -444,6 +448,7 @@ extern "C" void app_main() {
     if(!commands) return;
     bsp_display_lock(0);
     lv_display_set_rotation(display,LV_DISPLAY_ROTATION_90);
+    fast_flush_install(display);
     ui_build();
     screen_init(screen_woke);
     bsp_display_unlock();

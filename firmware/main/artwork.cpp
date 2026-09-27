@@ -13,6 +13,8 @@ extern "C" const char* lodepng_error_text(unsigned code);
 #include "esp_log.h"
 #include "esp_timer.h"
 #include <algorithm>
+#include <cmath>
+#include <utility>
 #include <cstring>
 #include <initializer_list>
 #include <mutex>
@@ -243,16 +245,61 @@ void halve(Image& img) {
     img.buffer = std::move(out);
     img.w = dw; img.h = dh;
 }
-void shrink_nearest(Image& img, uint32_t tw, uint32_t th) {
+// Centre square of the image, so covers fill their frame without letterboxing.
+void crop_square(Image& img) {
+    const uint32_t side = std::min(img.w, img.h);
+    if (img.w == side && img.h == side) return;
     Buffer out;
-    out.allocate(tw * th * 2);
+    out.allocate(side * side * 2);
+    const uint32_t x0 = (img.w - side) / 2, y0 = (img.h - side) / 2;
+    for (uint32_t y = 0; y < side; ++y)
+        std::memcpy(out.data + y * side * 2, img.buffer.data + ((y0 + y) * img.w + x0) * 2, side * 2);
+    img.buffer = std::move(out);
+    img.w = img.h = side;
+}
+// Bilinear resample to exactly side x side (up or down; large reductions are
+// box-filtered by halve() first).
+void resample(Image& img, uint32_t side) {
+    if (img.w == side && img.h == side) return;
+    Buffer out;
+    out.allocate(side * side * 2);
     const auto* src = img.pixels();
     auto* dst = reinterpret_cast<uint16_t*>(out.data);
-    for (uint32_t y = 0; y < th; ++y)
-        for (uint32_t x = 0; x < tw; ++x)
-            dst[y * tw + x] = src[(y * img.h / th) * img.w + (x * img.w / tw)];
+    const uint32_t scale_x = ((img.w - 1) << 16) / std::max<uint32_t>(side - 1, 1);
+    const uint32_t scale_y = ((img.h - 1) << 16) / std::max<uint32_t>(side - 1, 1);
+    for (uint32_t y = 0; y < side; ++y) {
+        const uint32_t fy = y * scale_y, sy = fy >> 16, wy = (fy >> 8) & 255, sy1 = std::min(sy + 1, img.h - 1);
+        for (uint32_t x = 0; x < side; ++x) {
+            const uint32_t fx = x * scale_x, sx = fx >> 16, wx = (fx >> 8) & 255, sx1 = std::min(sx + 1, img.w - 1);
+            const uint16_t p[4] = {src[sy * img.w + sx], src[sy * img.w + sx1], src[sy1 * img.w + sx], src[sy1 * img.w + sx1]};
+            const uint32_t w[4] = {(256 - wx) * (256 - wy), wx * (256 - wy), (256 - wx) * wy, wx * wy};
+            uint32_t r = 0, g = 0, b = 0;
+            for (int i = 0; i < 4; ++i) { r += (p[i] >> 11) * w[i]; g += ((p[i] >> 5) & 63) * w[i]; b += (p[i] & 31) * w[i]; }
+            dst[y * side + x] = static_cast<uint16_t>(((r >> 16) << 11) | ((g >> 16) << 5) | (b >> 16));
+        }
+    }
     img.buffer = std::move(out);
-    img.w = tw; img.h = th;
+    img.w = img.h = side;
+}
+// Anti-aliased rounded corners blended into the background colour, so the UI
+// can blit the image as a plain rectangle instead of clipping it every frame.
+void round_corners(Image& img, uint32_t radius, uint32_t background) {
+    if (!radius) return;
+    const uint32_t br = (background >> 16) & 255, bg = (background >> 8) & 255, bb = background & 255;
+    auto* px = img.pixels();
+    for (uint32_t y = 0; y < radius; ++y)
+        for (uint32_t x = 0; x < radius; ++x) {
+            const float dx = radius - x - 0.5f, dy = radius - y - 0.5f;
+            const float coverage = std::clamp(radius - std::sqrt(dx * dx + dy * dy) + 0.5f, 0.0f, 1.0f);
+            if (coverage >= 1.0f) continue;
+            const uint32_t a = static_cast<uint32_t>(coverage * 256);
+            for (auto [cx, cy] : {std::pair{x, y}, {img.w - 1 - x, y}, {x, img.h - 1 - y}, {img.w - 1 - x, img.h - 1 - y}}) {
+                uint16_t& p = px[cy * img.w + cx];
+                const uint32_t r = ((p >> 11) << 3), g = (((p >> 5) & 63) << 2), b = ((p & 31) << 3);
+                const uint32_t nr = (r * a + br * (256 - a)) >> 8, ng = (g * a + bg * (256 - a)) >> 8, nb = (b * a + bb * (256 - a)) >> 8;
+                p = static_cast<uint16_t>(((nr >> 3) << 11) | ((ng >> 2) << 5) | (nb >> 3));
+            }
+        }
 }
 }
 std::string artwork_url(const std::string& speaker_ip, const std::string& art_uri) {
@@ -261,8 +308,9 @@ std::string artwork_url(const std::string& speaker_ip, const std::string& art_ur
     if (art_uri.compare(0, 7, "http://") == 0 || art_uri.compare(0, 8, "https://") == 0) return art_uri;
     throw std::runtime_error("Unsupported artwork URI");
 }
-Artwork fetch_artwork(const std::string& speaker_ip, const std::string& art_uri, uint32_t max_side) {
-    if (!max_side) throw std::runtime_error("max_side must be positive");
+Artwork fetch_artwork(const std::string& speaker_ip, const std::string& art_uri, uint32_t side,
+                      uint32_t corner_radius, uint32_t background) {
+    if (!side) throw std::runtime_error("side must be positive");
     const int64_t started = esp_timer_get_time();
     Body body;
     download(artwork_url(speaker_ip, art_uri), body);
@@ -272,16 +320,13 @@ Artwork fetch_artwork(const std::string& speaker_ip, const std::string& art_uri,
     else if (body.size >= 4 && std::memcmp(body.data, png_magic, 4) == 0) img = decode_png(body.data, body.size);
     else throw std::runtime_error("Unsupported artwork format");
     const uint32_t decoded_w = img.w, decoded_h = img.h;
-    uint32_t tw = img.w, th = img.h;
-    if (img.w > max_side || img.h > max_side) {
-        const double scale = static_cast<double>(max_side) / std::max(img.w, img.h);
-        tw = std::max<uint32_t>(1, img.w * scale);
-        th = std::max<uint32_t>(1, img.h * scale);
-    }
-    while (img.w >= 2 * tw && img.h >= 2 * th) halve(img);
-    if (img.w != tw || img.h != th) shrink_nearest(img, tw, th);
+    crop_square(img);
+    while (img.w >= 2 * side) halve(img);
+    resample(img, side);
+    round_corners(img, corner_radius, background);
     ESP_LOGI(TAG, "artwork: %u B -> %ux%u -> %ux%u in %lld ms", static_cast<unsigned>(body.size),
-             decoded_w, decoded_h, img.w, img.h, (esp_timer_get_time() - started) / 1000);
+             static_cast<unsigned>(decoded_w), static_cast<unsigned>(decoded_h), static_cast<unsigned>(img.w),
+             static_cast<unsigned>(img.h), (esp_timer_get_time() - started) / 1000);
     Artwork art;
     art.width = img.w; art.height = img.h; art.stride = img.w * 2;
     art.pixels = img.buffer.data;

@@ -44,7 +44,7 @@ bash tools/idf.sh build
 
 The toolchain stays in `.tools/`. The firmware binary is `firmware/build/sonos_controller.bin`; use the generated flash arguments, including its matching bootloader and partition table. ESP-IDF component versions are locked in `firmware/dependencies.lock`. The build may need network access on first run; on sandboxed macOS, Component Manager also needs process-inspection permission.
 
-**Detect the P4 chip revision before flashing.** IDF 5.5.3 builds for P4 revisions 0.x/1.x and 3.x are mutually incompatible. The default configuration targets 0.x/1.x. It is not a universal binary. The display driver revision (ST7121/ST7123/ILI9881C) does not identify the P4 chip revision.
+**Detect the P4 chip revision before flashing.** IDF 5.5.3 builds for P4 revisions 0.x/1.x and 3.x are mutually incompatible. The default configuration targets 1.x (minimum v1.0, needed for 80 MHz flash); it will not boot on 0.x or 3.x chips. It is not a universal binary. The display driver revision (ST7121/ST7123/ILI9881C) does not identify the P4 chip revision.
 
 For a verified P4 3.x device, create a separate build/configuration:
 

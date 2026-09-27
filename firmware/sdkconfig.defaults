@@ -1,13 +1,19 @@
 CONFIG_IDF_TARGET="esp32p4"
 CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
-CONFIG_ESP32P4_REV_MIN_0=y
+# v1.0 minimum (this unit is v1.3): IDF only allows 80 MHz flash above rev 0.x.
+CONFIG_ESP32P4_REV_MIN_100=y
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+# Code and font bitmaps execute/read from flash through the cache; M5Stack's
+# factory firmware runs this chip at DIO 80 MHz, twice our former 40 MHz.
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_SPEED_200M=y
 CONFIG_SPIRAM_USE_MALLOC=y
 CONFIG_COMPILER_CXX_EXCEPTIONS=y
+# LVGL renders in software; -O2 roughly halves frame times versus the -Og default.
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=12288
 CONFIG_LV_FONT_MONTSERRAT_20=y
 CONFIG_LV_FONT_MONTSERRAT_22=y
@@ -16,6 +22,13 @@ CONFIG_LV_FONT_MONTSERRAT_36=y
 CONFIG_LV_FONT_MONTSERRAT_48=y
 CONFIG_LV_FONT_DEFAULT_MONTSERRAT_28=y
 CONFIG_LV_USE_SYSMON=n
+# The panel is portrait; rotate each flushed band with the P4's PPA instead of the CPU.
+CONFIG_LVGL_PORT_ENABLE_PPA=y
+# Frames now render in ~17-48 ms; a 33 ms refresh timer would cap them at 30 fps.
+CONFIG_LV_DEF_REFR_PERIOD=16
+# Internal DMA RAM is nearly all display buffers; TLS handshakes for artwork
+# failed at ~24 KB free, so mbedTLS allocates from PSRAM instead.
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
 # LVGL's built-in pool is 64 KB; use the system heap (large blocks go to PSRAM).
 CONFIG_LV_USE_CLIB_MALLOC=y
 CONFIG_LV_USE_SNAPSHOT=y
