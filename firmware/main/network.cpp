@@ -6,6 +6,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "lwip/sockets.h"
+#include "esp_log.h"
+#include <cerrno>
 #include <algorithm>
 #include <cctype>
 #include <cstring>
@@ -13,6 +15,7 @@
 #include <stdexcept>
 
 namespace {
+const char* TAG="network";
 EventGroupHandle_t events;
 bool started = false;
 bool reconnect = true;
@@ -68,12 +71,32 @@ void network_connect(const std::string& ssid, const std::string& password) {
     if (!(xEventGroupWaitBits(events,1,pdFALSE,pdFALSE,pdMS_TO_TICKS(20000)) & 1))
         throw std::runtime_error("Wi-Fi connection timed out. Check credentials and 2.4 GHz coverage.");
 }
+// Distinguishes "the network cannot reach the speaker" from "the HTTP client
+// misbehaved", which a single ESP_ERR_HTTP_CONNECT cannot tell us. Discovery
+// already proves UDP multicast works, so a failure here is specific to TCP.
+static void log_tcp_reachability(const std::string& ip, uint16_t port) {
+    int fd=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);
+    if(fd<0) { ESP_LOGE(TAG,"probe: socket() failed errno=%d",errno); return; }
+    struct Cleanup { int fd; ~Cleanup(){close(fd);} } cleanup{fd};
+    timeval timeout{5,0};
+    setsockopt(fd,SOL_SOCKET,SO_SNDTIMEO,&timeout,sizeof(timeout));
+    sockaddr_in address{};
+    address.sin_family=AF_INET; address.sin_port=htons(port);
+    inet_pton(AF_INET,ip.c_str(),&address.sin_addr);
+    int rc=connect(fd,reinterpret_cast<sockaddr*>(&address),sizeof(address));
+    if(rc==0) ESP_LOGI(TAG,"probe: TCP %s:%u reachable",ip.c_str(),port);
+    else ESP_LOGE(TAG,"probe: TCP %s:%u failed rc=%d errno=%d (%s)",ip.c_str(),port,rc,errno,strerror(errno));
+}
+
 std::string soap_http(const sonos::Request& request) {
     if (!network_online()) throw std::runtime_error("Wi-Fi is disconnected");
+    log_tcp_reachability(request.ip, 1400);
     const auto url="http://"+request.ip+":1400"+request.path;
     Body body;
     esp_http_client_config_t config{};
-    config.url=url.c_str(); config.timeout_ms=3000;
+    // Generous: the hosted SDIO link to the C6 is clocked conservatively, and a
+    // five-room topology response does not fit comfortably in a short budget.
+    config.url=url.c_str(); config.timeout_ms=30000;
     config.event_handler=http_event; config.user_data=&body;
     config.disable_auto_redirect=true;
     config.buffer_size=4096;
@@ -86,6 +109,10 @@ std::string soap_http(const sonos::Request& request) {
     check(esp_http_client_set_header(client,"SOAPACTION",action.c_str()),"SOAP action");
     check(esp_http_client_set_post_field(client,request.body.data(),request.body.size()),"SOAP body");
     auto result=esp_http_client_perform(client);
+    if(result!=ESP_OK)
+        ESP_LOGE(TAG,"soap: %s:%d %s failed: %s (received %zu bytes, status %d)",
+                 request.ip.c_str(),1400,request.action.c_str(),esp_err_to_name(result),
+                 body.xml.size(),esp_http_client_get_status_code(client));
     if(body.overflow) throw std::runtime_error("Speaker response exceeds device memory limit");
     check(result,"Speaker request failed; state will refresh before another action");
     int status=esp_http_client_get_status_code(client);

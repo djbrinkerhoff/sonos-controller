@@ -7,10 +7,20 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
+#include "bsp/m5stack_tab5.h"
+#include "driver/i2c_master.h"
+#include "esp_lcd_touch_st7123.h"
+#include "esp_lcd_touch_gt911.h"
+#ifdef CONFIG_TAB5_I2C_SCAN
+#include "esp_lvgl_port.h"
+#endif
 #include <algorithm>
 #include <memory>
 #include <stdexcept>
 #include <sstream>
+#ifdef CONFIG_TAB5_I2C_SCAN
+#include <cstdio>
+#endif
 
 namespace {
 const char* TAG="controller";
@@ -302,7 +312,7 @@ void worker(void*) {
         vTaskDelay(pdMS_TO_TICKS(300));
         network_init(); initialized=true;
     }
-    catch(const std::exception& e) { status(e.what()); }
+    catch(const std::exception& e) { status(e.what()); ESP_LOGE(TAG,"Startup failed: %s",e.what()); }
     auto boot=new Command; boot->action="Connect"; boot->ssid=setting("ssid"); boot->password=setting("password"); boot->seed=setting("seed");
     if(!boot->ssid.empty()) xQueueSend(commands,&boot,0); else {delete boot; status("Open Settings to connect to your home Wi-Fi.");}
     for(;;) {
@@ -337,14 +347,121 @@ void worker(void*) {
             // Drop queued actions after any failure; never replay a possibly completed queue mutation.
             Command* pending=nullptr;
             while(xQueueReceive(commands,&pending,0)==pdTRUE) delete pending;
-            status(e.what()); ESP_LOGW(TAG,"Controller operation failed; waiting for next refresh/action");
+            status(e.what()); ESP_LOGE(TAG,"Controller operation failed: %s",e.what());
         }
     }
 }
 }
+#ifdef CONFIG_TAB5_I2C_SCAN
+// Diagnostic only: enumerate the BSP I2C bus so the panel revision can be
+// identified from the hardware instead of from the rear label. Runs under the
+// same power sequence bsp_display_start() uses, so the result reflects the
+// state the real driver would probe in.
+static void i2c_scan_pass(const char* label, i2c_master_bus_handle_t bus) {
+    int hits = 0;
+    char line[128];
+    int n = snprintf(line, sizeof line, "SCAN %s:", label);
+    for (uint16_t addr = 0x08; addr <= 0x77; ++addr) {
+        if (i2c_master_probe(bus, addr, 50) == ESP_OK) {
+            n += snprintf(line + n, sizeof(line) - n, " 0x%02x", addr);
+            ++hits;
+        }
+    }
+    if (!hits) snprintf(line + n, sizeof(line) - n, " (none)");
+    ESP_LOGI(TAG, "%s", line);
+}
+
+static void i2c_scan_diagnostic() {
+    ESP_LOGI(TAG, "=== I2C scan diagnostic (TAB5_I2C_SCAN=y) ===");
+    i2c_master_bus_handle_t bus = bsp_i2c_get_handle();
+    if (!bus) { ESP_LOGE(TAG, "I2C bus handle unavailable"); return; }
+    ESP_LOGI(TAG, "bus ready, SDA=%d SCL=%d", BSP_I2C_SDA, BSP_I2C_SCL);
+
+    i2c_scan_pass("baseline", bus);
+
+    // Match bsp_display_new_with_handles() one call at a time, probing the
+    // touch address after each, to find which step loses the controller.
+    auto probe55 = [&](const char* when) {
+        esp_err_t r = i2c_master_probe(bus, ESP_LCD_TOUCH_IO_I2C_ST7123_ADDRESS, 100);
+        ESP_LOGI(TAG, "  0x55 @ %-22s -> %s", when, esp_err_to_name(r));
+    };
+
+    probe55("start");
+    if (bsp_feature_enable(BSP_FEATURE_LCD, true) != ESP_OK)
+        ESP_LOGE(TAG, "LCD feature enable failed");
+    probe55("after LCD enable");
+    if (bsp_display_brightness_init() != ESP_OK)
+        ESP_LOGE(TAG, "brightness init failed");
+    probe55("after brightness init");
+    if (bsp_feature_enable(BSP_FEATURE_TOUCH, true) != ESP_OK)
+        ESP_LOGE(TAG, "Touch feature enable failed");
+    probe55("after TOUCH enable");
+    vTaskDelay(pdMS_TO_TICKS(500));
+    probe55("after 500ms settle");
+
+    i2c_scan_pass("after LCD+bright+TOUCH", bus);
+
+    for (uint16_t addr : {ESP_LCD_TOUCH_IO_I2C_ST7123_ADDRESS,
+                          ESP_LCD_TOUCH_IO_I2C_GT911_ADDRESS_BACKUP}) {
+        esp_err_t r = i2c_master_probe(bus, addr, 200);
+        ESP_LOGI(TAG, "BSP touch probe 0x%02x -> %s", addr, esp_err_to_name(r));
+    }
+
+    // bsp_display_start_with_config() runs lvgl_port_init() *before* the panel
+    // init that performs the touch probe. Repeat the probe after that call to
+    // see whether LVGL port init is what takes the bus down.
+    {
+        lvgl_port_cfg_t lvgl_cfg = ESP_LVGL_PORT_INIT_CONFIG();
+        esp_err_t r = lvgl_port_init(&lvgl_cfg);
+        ESP_LOGI(TAG, "lvgl_port_init -> %s", esp_err_to_name(r));
+    }
+    vTaskDelay(pdMS_TO_TICKS(500));
+    i2c_scan_pass("after lvgl_port_init", bus);
+    {
+        esp_err_t r = i2c_master_probe(bus, ESP_LCD_TOUCH_IO_I2C_ST7123_ADDRESS, 200);
+        ESP_LOGI(TAG, "touch probe 0x55 after lvgl_port_init -> %s", esp_err_to_name(r));
+    }
+    ESP_LOGI(TAG, "=== scan complete; UI not started ===");
+}
+#endif
+
+// bsp_display_start() probes the touch controller to identify the panel, and
+// on ST7121/ST7123 units the responder at 0x55 is the TDDI itself, which is
+// briefly offline while the shared reset on the IO expander is released. The
+// probe can then miss entirely, and bsp_get_board_version() answers that with
+// assert(NULL) - a reboot loop we cannot retry our way out of, because it is a
+// raw libc assert rather than a BSP_ERROR_CHECK.
+//
+// So release the resets first and wait for the controller to actually answer,
+// rather than guessing a fixed delay: no published settle time exists, and the
+// 500 ms the BSP allows is hard-coded with no Kconfig override. Polling for the
+// real ACK adapts to whichever panel revision is fitted.
+//
+// Upstream tracking: espressif/esp-bsp issue #829 and PR #830 (one-line fix
+// that releases the reset before detection), both open as of this writing.
+static void await_touch_controller() {
+    bsp_i2c_get_handle();
+    bsp_feature_enable(BSP_FEATURE_LCD, true);
+    bsp_feature_enable(BSP_FEATURE_TOUCH, true);
+    for (int attempt = 1; attempt <= 40; ++attempt) {
+        if (i2c_master_probe(bsp_i2c_get_handle(), ESP_LCD_TOUCH_IO_I2C_ST7123_ADDRESS, 100) == ESP_OK ||
+            i2c_master_probe(bsp_i2c_get_handle(), ESP_LCD_TOUCH_IO_I2C_GT911_ADDRESS_BACKUP, 100) == ESP_OK) {
+            ESP_LOGI(TAG, "Touch controller answered after %d attempt(s)", attempt);
+            return;
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    ESP_LOGE(TAG, "Touch controller did not answer; display detection may fail");
+}
+
 extern "C" void app_main() {
     auto nvs=nvs_flash_init();
     if(nvs!=ESP_OK) { ESP_LOGE(TAG,"NVS init failed: %s (settings preserved)",esp_err_to_name(nvs)); return; }
+#ifdef CONFIG_TAB5_I2C_SCAN
+    i2c_scan_diagnostic();
+    return;
+#endif
+    await_touch_controller();
     auto display=bsp_display_start();
     if(!display) {ESP_LOGE(TAG,"Display initialization failed");return;}
     bsp_display_backlight_on();

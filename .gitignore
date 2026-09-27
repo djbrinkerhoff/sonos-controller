@@ -3,7 +3,9 @@
 artifacts/
 firmware/build/
 firmware/build-rev3/
+firmware/build-scan/
 firmware/sdkconfig.rev3.local*
+firmware/sdkconfig.scan.local*
 firmware/managed_components/
 firmware/sdkconfig
 firmware/sdkconfig.old

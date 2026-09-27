@@ -1,0 +1,15 @@
+menu "Tab5 bring-up diagnostics"
+
+config TAB5_I2C_SCAN
+    bool "Run an I2C bus scan instead of starting the UI"
+    default n
+    help
+        Enumerates every address on the BSP I2C bus under the same power
+        sequence the display driver uses, then returns without initializing
+        the panel. Used to identify the touch controller on hardware whose
+        revision the board support package does not recognise.
+
+        When enabled the device never starts the LVGL UI, so nothing appears
+        on screen and the serial log is the only output.
+
+endmenu

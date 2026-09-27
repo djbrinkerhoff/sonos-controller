@@ -1,6 +1,62 @@
 # Handoff: standalone Tab5 Sonos controller
 
-Updated September 26, 2026. The user explicitly asked to finish the current build/test step, stop, and write this handoff. Do not continue implementation automatically after delivering it.
+Updated September 26, 2026 (second pass, same day). The device is now flashed, booting, on Wi-Fi, and talking to the real household speakers. The board bring-up blockers are resolved; the unproven product milestone is now audible playback.
+
+## Session 2: hardware bring-up (what changed)
+
+The Tab5 appeared on USB as `/dev/cu.usbmodem2101` once the user attached it with a data cable.
+
+**Flash safety.** P4 revision is **v1.3**, so the default legacy build is correct and `sdkconfig.rev3` must **not** be used on this unit. A full 16 MB factory backup was taken before the first write, at `artifacts/tab5-original.bin` (`sha256 a260eda93e4e5ddc1d3abddd361b1eb326c07d4248b67d1b493feba057fde231`). Factory `human_face_det` and `storage` SPIFFS partitions were never in any erase window.
+
+**Boot loop, diagnosed and fixed.** `bsp_display_start()` hard-asserted and rebooted:
+
+```
+E M5Stack Tab5: Unsupported board version!
+assert failed: bsp_get_board_version bsp_display.c:189 (NULL)
+```
+
+A purpose-built I2C scan diagnostic (`CONFIG_TAB5_I2C_SCAN`, `firmware/sdkconfig.scan`) showed the touch controller *is* present at `0x55` and the bus is healthy, but it drops off I2C around the reset release and returns. Root cause is an **ordering** bug, not a timing one: the BSP probes for the panel before releasing the shared TDDI reset. On ST712x units the device at `0x55` *is* the TDDI, so it cannot ACK while held in reset. `BSP_LCD_EN` is a misnomer for that pin — it is `LCD_RST`.
+
+Fixed in `main.cpp` with `await_touch_controller()`, which releases the resets and then polls for a genuine ACK (up to ~2 s) instead of guessing a fixed delay. It now answers on attempt 1, so it costs nothing. A hard-coded 1500 ms delay was tried first and also worked, but was arbitrary — no published settle time exists.
+
+Upstream: espressif/esp-bsp [issue #829](https://github.com/espressif/esp-bsp/issues/829) and [PR #830](https://github.com/espressif/esp-bsp/pull/830) (one-line ordering fix, unmerged). 1.3.1 is still the latest release. Note `CONFIG_BSP_ERROR_CHECK=n` does **not** help: that branch is a raw libc `assert(NULL)`, so the fix must land before `bsp_display_start()`. The research suggests issue #829 may be the user's own filing — worth confirming.
+
+**Panel identified: ST7121** (`Discovered board version 3 (LCD ST7121, Touch ST712x, FW 1)`), the post-2026-04-28 revision. Detected by the firmware, not read from a label. M5Stack documents three revisions: ILI9881C+GT911, ST7123, ST7121.
+
+**Wi-Fi connected.** Credentials were written directly into the device's NVS partition (`controller` namespace, keys `ssid`/`password`/`seed`) using `nvs_partition_gen.py`, and the scratch CSV was deleted immediately. **No credential was ever compiled into a firmware binary.** The user was asked not to paste passwords into chat and did anyway; the value is in the session transcript and should be considered exposed. The app auto-connects on boot when `ssid` is non-empty.
+
+**SDIO throughput bug, found by measurement.** The original `sdkconfig.defaults` pinned the C6 link to **25 MHz with receive streaming disabled**. The component's own defaults are 40 MHz plus streaming mode, and its Kconfig help states P4-as-host is `<= 40MHz`. That over-conservatism was silently truncating SOAP replies — speakers returned `200 OK` and the transfer died partway:
+
+```
+ESP_ERR_HTTP_INCOMPLETE_DATA (received 1440 bytes, status 200)
+```
+
+Restoring the vendor defaults fixed it completely. This would have been misdiagnosed as flaky Wi-Fi without the byte-count logging.
+
+**Diagnostics added (keep these).** `catch` blocks now log `e.what()` instead of only painting it on screen — the first failure was unreadable without this. `log_tcp_reachability()` does a raw-socket probe before each SOAP call, which is what separated "network cannot reach the speaker" from "HTTP client misbehaved". SOAP failures now log action, error, bytes received, and HTTP status.
+
+## Validation status after session 2
+
+- P4 revision v1.3 confirmed on real hardware; factory flash backed up and verified.
+- Cold boot to LVGL UI: **passed**, no assert, single boot, backlight on.
+- Touch detection and input: **passed** (user confirmed landscape, legible, touch registers).
+- Panel revision auto-detected as ST7121: **passed**.
+- Wi-Fi association and DHCP on the C6: **passed**.
+- SSDP auto-discovery: **intermittent** — found a speaker on one boot, none on the next. Manual-IP path works reliably.
+- SOAP against a real speaker (`ListAvailableServices`, topology, favorites): **passed** with zero errors over a 110 s run at the raised timeout.
+- Audible playback, volume, grouping, saved areas: **still not performed.**
+
+## Open items
+
+- **SSDP discovery is unreliable** and is the main outstanding protocol bug. Everything currently works via a seeded manual IP, which is a stopgap: the address goes stale if the router reassigns it. Needs a real fix before this is an appliance.
+- The seeded `seed` IP is still present in device NVS and should be cleared once discovery is fixed.
+- `timeout_ms` is now 30 s for SOAP. That is generous, not measured; revisit once discovery is stable.
+- Artwork is parsed but not rendered. Queue browser/editing, battery/charging, dim/sleep/wake, OTA signing/rollback, and soak testing remain.
+- Wi-Fi credentials live in ordinary NVS. Production credential protection remains.
+- State is polled every four seconds, not event-subscribed. Reconnect/IP-change recovery needs hardening.
+- A failed action is not retried; pending actions are dropped on error, and partial queue/grouping operations may already have happened.
+- Address `0x28` appears on the I²C bus but is in no official M5Stack I²C map. Unexplained; possibly worth reporting upstream.
+- The `CONFIG_TAB5_I2C_SCAN` diagnostic is retained; the `lvgl_port_init` and per-step probing it also does are what isolated the ordering bug.
 
 ## User decisions and instructions
 
@@ -9,7 +65,7 @@ Updated September 26, 2026. The user explicitly asked to finish the current buil
 - Only Apple Music and, if workable, Sonos Radio should be launchable. Do not remove other services from the user's Sonos account.
 - Control rooms, grouping, saved areas, playback and room/group volume.
 - Only used on the same network as the speakers. This Mac is on that network.
-- User has the Tab5. We asked them to connect it by USB data cable and identify its rear display label; no reply to that hardware question yet. No USB serial device has appeared so far.
+- User has the Tab5, connected by USB data cable as `/dev/cu.usbmodem2101`. Hardware question is now answered by the firmware: this unit is an **ST7121** panel revision.
 - User's stated inventory: Beam Gen 2, Play:1, Era 100, Era 300, Beam Gen 1; all use the current Sonos app, not S1.
 - User explicitly requested **Luna subagents for suitable tasks**. Two Luna agents implemented the read-only probe and board research/native tests. No new chats were created.
 - AGENTS instruction: always use Context7 for library/API documentation, code generation and setup. Context7 was used for SoCo, ESP-IDF and LVGL; exact vendor source was also inspected.
@@ -34,7 +90,7 @@ Important files:
 - `tests/core_test.cpp`, `tools/test_core.sh`, `tests/test_probe.py`: synthetic regression tests.
 - `docs/tab5-board.md`: source-verified board setup.
 
-The project was an empty directory before this work. There was no Git repository, remote, or existing application to preserve. No commits, PRs or deployment were made.
+The project was an empty directory before this work. There was a single initial commit (`7ae7fcc`) covering the prototype; an earlier version of this handoff incorrectly stated no repository or commits existed. No PRs or deployments were made.
 
 ## What the live network check established
 
@@ -64,13 +120,15 @@ Pinned components:
 
 Do not casually unpin LVGL port: initially the BSP's `^2` dependency resolved to **2.9.0**, which does not compile against this IDF's DPI callback type (`on_frame_buf_complete` mismatch). Pinning 2.6.2 fixed it.
 
-The BSP supports ILI9881C/GT911, ST7123 and ST7121 through touch-controller detection, despite incomplete registry table wording. LCD's native resolution is 720×1280; application requests 90-degree rotation for landscape. Touch alignment and visual layout are not hardware-verified.
+The BSP supports ILI9881C/GT911, ST7123 and ST7121 through touch-controller detection, despite incomplete registry table wording. LCD's native resolution is 720×1280; the application requests 90-degree rotation for landscape. Touch alignment and visual layout are now **hardware-verified** (user confirmed landscape, legible, touch registering), though the type is small.
 
-C6 power: `bsp_feature_enable(BSP_FEATURE_WIFI, true)` before remote Wi-Fi initialization. Hosted SDIO pins: reset 15, CLK 12, CMD 13, D0 11, D1 10, D2 9, D3 8. Host clock is conservatively set to 25 MHz and receive streaming optimization disabled. Factory C6 firmware compatibility still needs validation; do not overwrite it routinely.
+C6 power: `bsp_feature_enable(BSP_FEATURE_WIFI, true)` before remote Wi-Fi initialization. Hosted SDIO pins: reset 15, CLK 12, CMD 13, D0 11, D1 10, D2 9, D3 8. Host clock is **40 MHz with receive streaming mode enabled** — these are the component's own defaults and must not be reduced. An earlier 25 MHz / `SDIO_OPTIMIZATION_RX_NONE` setting silently truncated SOAP responses; see session 2 above. Do not overwrite the factory C6 firmware routinely.
 
-**P4 chip revision is a mandatory pre-flash check.** IDF 5.5.3 defaults to revision 3.1, which cannot run on earlier chips. The final default build deliberately targets P4 **0.x/1.x**, using `ESP32P4_SELECTS_REV_LESS_V3=y` and minimum revision 0.0. Revision 3.x needs a separate build using `sdkconfig.rev3`. Chip revision and LCD driver revision are different facts.
+**P4 chip revision is a mandatory pre-flash check.** IDF 5.5.3 defaults to revision 3.1, which cannot run on earlier chips. The default build deliberately targets P4 **0.x/1.x**, using `ESP32P4_SELECTS_REV_LESS_V3=y` and minimum revision 0.0. This unit is **v1.3**, verified on hardware, so the default build is correct. Revision 3.x needs a separate build using `sdkconfig.rev3`. Chip revision and LCD driver revision are different facts.
 
-The latest successful default firmware build produced `firmware/build/sonos_controller.bin`, size `0x19b8c0` bytes (about 1.61 MiB), with 77% of the 7 MiB application partition free. Associated bootloader, partition table and flash arguments are in the same build directory. This is a prototype factory partition layout, without OTA slots.
+The current default firmware build produces `firmware/build/sonos_controller.bin`, size `0x19be60` bytes (about 1.62 MiB), with 77% of the 7 MiB application partition free. Associated bootloader, partition table and flash arguments are in the same build directory. This is a prototype factory partition layout, without OTA slots. A separate scan build lives in `firmware/build-scan/` via `firmware/sdkconfig.scan`.
+
+Note: changing `sdkconfig.defaults` requires deleting `firmware/sdkconfig` so the values regenerate; the cached file wins otherwise. This is how the SDIO clock fix was applied.
 
 Build log: `artifacts/firmware-build.log`. Some local incremental builds can run sandboxed, but CMake reconfiguration uses `psutil` process inspection; macOS sandbox denies that. Run `bash tools/idf.sh build` with tool escalation if it fails on `sysctl()` in Component Manager. This was a sandbox restriction, not a firmware error. Network access is also needed when resolving components for the first time.
 
@@ -80,7 +138,8 @@ Build log: `artifacts/firmware-build.log`. Some local incremental builds can run
 - Live read-only Sonos discovery/metadata: **passed**.
 - Native C++ tests: **passed, 40 assertions**, via `bash tools/test_core.sh`.
 - Python probe tests: **passed, 9 tests**, via `python3 -m unittest discover -s tests -p 'test_*.py'`.
-- Tab5 flash/boot, touch layout, Wi-Fi connection, audible playback, and grouping/volume mutation checks: **not performed**.
+- Tab5 flash, cold boot, touch, Wi-Fi association, and SOAP exchange with a real speaker: **passed** (see session 2).
+- Audible playback and grouping/volume mutations: **not performed**. This is the remaining unproven milestone.
 
 ## Current limitations and review points
 
@@ -91,17 +150,14 @@ Build log: `artifacts/firmware-build.log`. Some local incremental builds can run
 - A failed action is not retried automatically; pending queued actions are dropped on error. Partial queue/grouping operations can still have happened before a timeout. The next step should verify actual state before another mutation.
 - Areas store stable room IDs. The app saves the selected room's current group; applying an area verifies all saved rooms exist before grouping and excludes outsiders from the restored group. Hardware tests must confirm expected coordinator/music behavior.
 - Source filtering fails closed. Unknown/conflicting identities and non-playable promotional favorites are excluded. The controller can display neutral state and stop/adjust volume for content started by another app.
-- A computer-based probe or successful build does not establish that the C6 factory firmware, selected P4 revision, touch rotation, or favorite playback path works on the physical Tab5.
+- A computer-based probe or successful build does not establish that favorite playback works on the physical Tab5.
 
 ## Exact next steps when the user resumes
 
-1. Read this handoff and the final validation note. Inspect current files before changing anything; agents share this directory.
-2. Confirm the Tab5 is connected through a USB data cable and inspect `/dev/cu.*`. Only Bluetooth/audio/debug-console ports were visible at the last check.
-3. Use the project's Python/esptool environment to read chip info (`--chip esp32p4 --port PORT chip_id`). Select the matching legacy or revision-3 firmware configuration. Do not use `--force` to bypass a revision mismatch.
-4. Back up the original full flash to an ignored artifact **before the first flash**. README contains the read-flash command. No backup exists yet because no device was visible.
-5. Flash the matching build and watch serial boot logs. Verify screen/touch, then enter Wi-Fi details on-device; don't ask the user to paste passwords into chat.
-6. Validate one Apple Music favorite and the Radio favorite at a modest existing volume, then transport, room/group volume, groups, saved areas and external changes from the official app. This is the main unproven product milestone.
-7. Fix observed board/protocol issues before expanding UI/features. Then finish the appliance work listed above.
+1. Read this handoff. Inspect current files before changing anything; agents share this directory.
+2. **Validate audible playback** — the main unproven product milestone. Play one Apple Music favorite and the Radio favorite at a modest existing volume, then transport, room/group volume, groups, saved areas, and external changes from the official app.
+3. **Fix SSDP auto-discovery.** It is intermittent and is the main outstanding protocol bug. The seeded manual IP is a stopgap that goes stale if the router reassigns addresses. Clear the `seed` key from NVS once discovery is reliable.
+4. Fix any board/protocol issues observed during playback before expanding UI/features. Then finish the appliance work listed above.
 
 Commands from project root:
 
@@ -111,16 +167,35 @@ bash tools/test_core.sh
 bash tools/idf.sh build
 ```
 
-For a verified P4 3.x chip:
+Flash and capture logs (this unit is P4 v1.3, so use the default build):
+
+```sh
+cd firmware/build
+python -m esptool --chip esp32p4 --port /dev/cu.usbmodem2101 write_flash \
+  --flash_mode dio --flash_freq 40m --flash_size 16MB --verify \
+  0x2000 bootloader/bootloader.bin 0x10000 sonos_controller.bin 0x8000 partition_table/partition-table.bin
+```
+
+esptool 4.12 wants the flash-mode flags on the `write_flash` subcommand, not before it.
+
+The I2C scan diagnostic builds separately and does not touch the default build:
+
+```sh
+bash tools/idf.sh -B build-scan -D SDKCONFIG=sdkconfig.scan.local -D 'SDKCONFIG_DEFAULTS=sdkconfig.defaults;sdkconfig.scan' build
+```
+
+For a verified P4 3.x chip (not this unit):
 
 ```sh
 bash tools/idf.sh -B build-rev3 -D SDKCONFIG=sdkconfig.rev3.local -D 'SDKCONFIG_DEFAULTS=sdkconfig.defaults;sdkconfig.rev3' build
 ```
 
-Do not resume further work in this turn: the user asked to stop after this checkpoint.
-
 ## Final checkpoint
 
-All build/test work for this checkpoint is finished. Final verified results are the successful legacy-P4 firmware build, 40 passing native assertions, 9 passing Python tests, and successful read-only household metadata access. The saved private report was reclassified locally using the corrected provider/launchability logic; it now contains 17 `allowed_favorites`, with no additional network or speaker mutation calls.
+Verified results: the legacy-P4 firmware build, 40 passing native assertions, 9 passing Python tests, read-only household metadata access, and — as of session 2 — a verified factory flash backup, a clean single-boot to the LVGL UI on real hardware, ST7121 panel detection, Wi-Fi association with a DHCP lease, and a SOAP exchange with a real speaker completing with zero errors.
 
-The Tab5 still does not appear on USB. No flash backup, flash write, audible playback test, or UI visual inspection has occurred. No model- or agent-owned background work should continue after this handoff; wait for the user to resume.
+Still unproven: **audible playback.** No playback, volume, or grouping mutation has ever been sent to the user's speakers. The saved private report contains 17 `allowed_favorites`.
+
+A backup of the device's original flash exists at `artifacts/tab5-original.bin` and should be preserved. To return the Tab5 to factory firmware, write that image back and reset.
+
+No model- or agent-owned background work should continue after this handoff; wait for the user to resume.
