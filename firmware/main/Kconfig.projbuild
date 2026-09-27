@@ -22,3 +22,33 @@ config TAB5_FORGET_SPEAKERS
         on hardware; flash the normal build afterwards.
 
 endmenu
+
+menu "Tab5 power and motion"
+
+config TAB5_MOTION_DPS
+    int "Gyroscope magnitude that counts as motion (deg/s)"
+    default 12
+    range 1 2000
+    help
+        The BMI270 is polled at 25 Hz. A gyroscope vector magnitude above
+        this threshold wakes the screen, debounced to at most one callback
+        per 500 ms.
+
+config TAB5_MOTION_MILLI_G
+    int "Accelerometer delta that counts as motion (milli-g)"
+    default 120
+    range 1 16000
+    help
+        Wakes the screen when the accelerometer vector differs from a
+        slow-moving baseline by more than this much, so gravity and a new
+        resting orientation settle out instead of keeping the screen on.
+
+config TAB5_MOTION_LOG
+    bool "Log motion sensor maxima once per second"
+    default n
+    help
+        Logs the largest gyroscope magnitude (deg/s) and accelerometer
+        baseline delta (milli-g) seen each second, to calibrate
+        TAB5_MOTION_DPS and TAB5_MOTION_MILLI_G on hardware.
+
+endmenu
