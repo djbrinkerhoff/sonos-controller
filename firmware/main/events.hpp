@@ -3,7 +3,11 @@
 #include <string>
 #include <vector>
 
-struct EventTarget { std::string ip; std::string service; };
+struct EventTarget {
+    std::string ip; std::string service;
+    bool operator==(const EventTarget& o) const { return ip==o.ip && service==o.service; }
+    bool operator!=(const EventTarget& o) const { return !(*this==o); }
+};
 
 // Starts the local HTTP server on port 3400 and the subscription maintenance
 // task. on_event is invoked from the server task with the service name on each

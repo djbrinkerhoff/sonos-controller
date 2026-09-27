@@ -2,6 +2,11 @@
 #include "network.hpp"
 #include "screen.hpp"
 #include "power.hpp"
+#include "artwork.hpp"
+#include "misc/cache/instance/lv_image_cache.h"
+#include "events.hpp"
+#include "ota.hpp"
+#include "debug.hpp"
 #include "sonos.hpp"
 #include "esp_log.h"
 #include "nvs_flash.h"
@@ -17,6 +22,8 @@
 #include "esp_lvgl_port.h"
 #endif
 #include <algorithm>
+#include <atomic>
+#include <cstring>
 #include <memory>
 #include <stdexcept>
 #include <sstream>
@@ -49,6 +56,9 @@ std::vector<Area> areas;
 bool initialized=false;
 bool storage_ok=true;
 bool catalog_loaded=false;
+// Speaker events arrive on the HTTP server task; they only nudge the worker.
+std::atomic<bool> event_pending{false}, topology_event{false};
+std::atomic<TickType_t> last_event{0};
 
 struct DisplayLock { DisplayLock(){bsp_display_lock(0);} ~DisplayLock(){bsp_display_unlock();} };
 std::string setting(const char* key) {
@@ -194,14 +204,14 @@ void render_queue(const sonos::Room& target,const std::vector<sonos::QueueItem>&
 void refresh_clicked(lv_event_t*) { auto c=new Command; c->action="Refresh"; enqueue(c); }
 void volume_changed(lv_event_t* event) {
     int value=lv_slider_get_value(volume_slider);
-    lv_label_set_text_fmt(volume_label,"Room volume · %d",value);
+    lv_label_set_text_fmt(volume_label,"Room volume   %d",value);
     if(lv_event_get_code(event)==LV_EVENT_RELEASED && !selected.id.empty()) {
         auto c=new Command; c->action="Volume"; c->room=selected; c->value=value; enqueue(c);
     }
 }
 void group_volume_changed(lv_event_t* event) {
     int value=lv_slider_get_value(group_slider);
-    lv_label_set_text_fmt(group_label,"Group volume · %d",value);
+    lv_label_set_text_fmt(group_label,"Group volume   %d",value);
     if(lv_event_get_code(event)==LV_EVENT_RELEASED && !selected.id.empty()) {
         auto c=new Command; c->action="GroupVolume"; c->room=selected; c->value=value; enqueue(c);
     }
@@ -269,6 +279,37 @@ void render_catalog(std::vector<sonos::Room> new_rooms,std::vector<sonos::Favori
         auto l=lv_obj_get_child(b,0); lv_obj_set_width(l,lv_pct(95)); lv_label_set_long_mode(l,LV_LABEL_LONG_DOT);
     }
 }
+// The pixels behind art_image; replaced only with the display lock held.
+Artwork art_pixels;
+lv_image_dsc_t art_dsc{};
+void render_artwork(const sonos::Room& target,Artwork art) {
+    DisplayLock lock;
+    if(target.id!=selected.id) return;
+    lv_image_set_src(art_image,nullptr);
+    lv_image_cache_drop(&art_dsc);
+    art_pixels=std::move(art);
+    const bool shown=art_pixels.pixels!=nullptr;
+    if(shown) {
+        art_dsc=lv_image_dsc_t{};
+        art_dsc.header.magic=LV_IMAGE_HEADER_MAGIC; art_dsc.header.cf=LV_COLOR_FORMAT_RGB565;
+        art_dsc.header.w=art_pixels.width; art_dsc.header.h=art_pixels.height; art_dsc.header.stride=art_pixels.stride;
+        art_dsc.data_size=art_pixels.stride*art_pixels.height; art_dsc.data=art_pixels.pixels;
+        lv_image_set_src(art_image,&art_dsc);
+        // Small artwork is scaled up to fill the panel rather than floating in it.
+        const uint32_t side=std::max(art_pixels.width,art_pixels.height);
+        lv_image_set_scale(art_image,side<400?400*256/side:256);
+        lv_obj_center(art_image);
+    }
+    lv_obj_set_flag(art_image,LV_OBJ_FLAG_HIDDEN,!shown);
+    lv_obj_set_flag(art_placeholder,LV_OBJ_FLAG_HIDDEN,shown);
+}
+void speaker_event(const char* service) {
+    last_event=xTaskGetTickCount();
+    if(!std::strcmp(service,"ZoneGroupTopology")) topology_event=true;
+    if(event_pending.exchange(true)) return; // one refresh covers a burst
+    auto c=new Command; c->action="Event";
+    if(xQueueSend(commands,&c,0)!=pdTRUE) { delete c; event_pending=false; }
+}
 void render_battery(const Battery& battery) {
     DisplayLock lock;
     if(!battery.present) { lv_label_set_text(battery_label,LV_SYMBOL_USB); return; }
@@ -281,14 +322,14 @@ void render_state(const sonos::Room& target,const sonos::State& state) {
     if(target.id!=selected.id) return;
     current=state;
     lv_label_set_text(title_label,state.title.empty()?"Nothing playing":state.title.c_str());
-    lv_label_set_text(artist_label,(state.artist+ (state.album.empty()?"":" · "+state.album)).c_str());
+    lv_label_set_text(artist_label,(state.artist+ (state.album.empty()?"":"  -  "+state.album)).c_str());
     if(!lv_obj_has_state(volume_slider,LV_STATE_PRESSED)) {
         lv_slider_set_value(volume_slider,state.volume,LV_ANIM_OFF);
-        lv_label_set_text_fmt(volume_label,"Room volume · %d",state.volume);
+        lv_label_set_text_fmt(volume_label,"Room volume   %d",state.volume);
     }
     if(!lv_obj_has_state(group_slider,LV_STATE_PRESSED)) {
         lv_slider_set_value(group_slider,state.group_volume,LV_ANIM_OFF);
-        lv_label_set_text_fmt(group_label,"Group volume · %d",state.group_volume);
+        lv_label_set_text_fmt(group_label,"Group volume   %d",state.group_volume);
     }
     lv_label_set_text(lv_obj_get_child(play_button,0),state.playback=="PLAYING"?LV_SYMBOL_PAUSE:LV_SYMBOL_PLAY);
     lv_label_set_text(lv_obj_get_child(mute_button,0),state.muted?LV_SYMBOL_VOLUME_MAX:LV_SYMBOL_MUTE);
@@ -298,7 +339,7 @@ void render_state(const sonos::Room& target,const sonos::State& state) {
     };
     lv_obj_set_state(next_button,LV_STATE_DISABLED,!supports("Next"));
     lv_obj_set_state(prev_button,LV_STATE_DISABLED,!supports("Previous"));
-    lv_label_set_text(status_label,network_online()?"Connected · local control":"Wi-Fi disconnected");
+    lv_label_set_text(status_label,network_online()?"Connected - local control":"Wi-Fi disconnected");
 }
 void build_ui() {
     auto display=lv_display_get_default();
@@ -378,7 +419,7 @@ void build_ui() {
     lv_textarea_set_text(password_input,setting("password").c_str());
     lv_textarea_set_text(seed_input,setting("seed").c_str());
     button(setup,"Connect & save",connect_clicked);
-    label(setup,"Prototype · standalone · Apple Music + Sonos Radio favorites");
+    label(setup,"Prototype - standalone - Apple Music + Sonos Radio favorites");
 
     status_label=label(screen,"Starting..."); lv_obj_set_width(status_label,lv_pct(95)); lv_obj_align(status_label,LV_ALIGN_BOTTOM_LEFT,24,-8);
     lv_obj_set_style_text_font(status_label,&lv_font_montserrat_22,0);
@@ -409,6 +450,7 @@ void refresh() {
     auto f=client.favorites(seed);
     render_catalog(std::move(found),std::move(f));
     catalog_loaded=true;
+    ota_mark_healthy(); // a new image proves itself by reaching the speakers
 }
 void worker(void*) {
     try {
@@ -417,6 +459,8 @@ void worker(void*) {
         motion_start(screen_note_motion);
         vTaskDelay(pdMS_TO_TICKS(300));
         network_init(); initialized=true;
+        events_start(speaker_event);
+        if(auto server=events_server()) { ota_register(server); debug_register(server); }
     }
     catch(const std::exception& e) { status(e.what()); ESP_LOGE(TAG,"Startup failed: %s",e.what()); }
     auto boot=new Command; boot->action="Connect"; boot->ssid=setting("ssid"); boot->password=setting("password"); boot->seed=setting("seed");
@@ -424,9 +468,14 @@ void worker(void*) {
     else { delete boot; status(storage_ok?"Open Settings to connect to your home Wi-Fi.":"Settings storage failed; settings will not be saved. Open Settings to connect."); }
     TickType_t last_catalog_attempt=0, last_topology=0, last_battery=0;
     int queue_track=-1; std::string queue_room; // what the Queue tab currently shows
+    std::vector<EventTarget> subscribed; TickType_t subscribed_at=0;
+    std::string art_uri="\x01", art_room;         // what the artwork panel currently shows
     for(;;) {
         Command* raw=nullptr;
-        xQueueReceive(commands,&raw,pdMS_TO_TICKS(4000));
+        // Sonos answers a new subscription with a full-state event, so an event
+        // since subscribing proves events work and polling can relax.
+        const bool events_live=subscribed_at && last_event.load()>=subscribed_at;
+        xQueueReceive(commands,&raw,pdMS_TO_TICKS(events_live?15000:4000));
         std::unique_ptr<Command> c(raw);
         try {
             // A boot-time connect can fail while the router is down; the Wi-Fi
@@ -455,6 +504,7 @@ void worker(void*) {
                 else if(c->action=="Join") {client.join(c->room,c->destination); refresh();}
                 else if(c->action=="Ungroup") {client.ungroup(c->room); refresh();}
                 else if(c->action=="Wake") client.invalidate_topology();
+                else if(c->action=="Event") { event_pending=false; if(topology_event.exchange(false)) client.invalidate_topology(); }
                 else if(c->action=="Queue") queue_track=-1;
                 else if(c->action=="QueueTrack") { client.play_queue_track(c->room,c->value); queue_track=-1; }
                 else if(c->action!="Poll") client.transport(c->room,c->action);
@@ -470,12 +520,23 @@ void worker(void*) {
             if(xTaskGetTickCount()-last_topology>pdMS_TO_TICKS(30000)) {
                 client.invalidate_topology(); last_topology=xTaskGetTickCount();
             }
-            if(!c && screen_off()) continue; // nobody is looking; save the speakers the traffic
+            if(screen_off() && (!c || c->action=="Event")) continue; // nobody is looking; save the speakers the traffic
             sonos::Room target;
             {DisplayLock lock; target=selected;}
             if(target.id.empty()) continue;
             const auto state=client.state(target);
             render_state(target,state);
+            const auto leader=client.coordinator(target);
+            std::vector<EventTarget> targets{{leader.ip,"AVTransport"},{target.ip,"RenderingControl"},
+                                             {leader.ip,"GroupRenderingControl"},{leader.ip,"ZoneGroupTopology"}};
+            if(targets!=subscribed) { events_set_targets(targets); subscribed=targets; subscribed_at=xTaskGetTickCount(); }
+            if(state.art!=art_uri || target.id!=art_room) {
+                art_uri=state.art; art_room=target.id;
+                Artwork art;
+                if(!state.art.empty()) try { art=fetch_artwork(target.ip,state.art,400); }
+                catch(const std::exception& e) { ESP_LOGW(TAG,"Artwork unavailable: %s",e.what()); }
+                render_artwork(target,std::move(art));
+            }
             bool queue_visible; {DisplayLock lock; queue_visible=lv_tabview_get_tab_active(tabs)==2;}
             if(queue_visible && (state.track!=queue_track || target.id!=queue_room)) {
                 // Show a window from just before the current track onwards.
@@ -599,6 +660,7 @@ static void await_touch_controller() {
 extern "C" void app_main() {
     // Never erase on failure: that would destroy saved settings. Boot without
     // persistence instead, so the device does not look bricked.
+    debug_log_init();
     auto nvs=nvs_flash_init();
     if(nvs!=ESP_OK) { ESP_LOGE(TAG,"NVS init failed: %s (settings preserved)",esp_err_to_name(nvs)); storage_ok=false; }
 #ifdef CONFIG_TAB5_FORGET_SPEAKERS
@@ -616,6 +678,7 @@ extern "C" void app_main() {
     i2c_scan_diagnostic();
     return;
 #endif
+    ota_log_boot();
     await_touch_controller();
     auto display=bsp_display_start();
     if(!display) {ESP_LOGE(TAG,"Display initialization failed");return;}

@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <strings.h>
 
 namespace {
 const char* TAG="events";
@@ -49,6 +50,18 @@ std::string event_path(const std::string& service) {
     return "/MediaRenderer/"+service+"/Event";
 }
 
+// esp_http_client_get_header() returns *request* headers; response headers
+// only arrive through HTTP_EVENT_ON_HEADER.
+struct ResponseHeaders { std::string sid, timeout; };
+esp_err_t on_header(esp_http_client_event_t* e) {
+    if(e->event_id==HTTP_EVENT_ON_HEADER && e->header_key && e->header_value) {
+        auto* h=static_cast<ResponseHeaders*>(e->user_data);
+        if(!strcasecmp(e->header_key,"SID")) h->sid=e->header_value;
+        else if(!strcasecmp(e->header_key,"TIMEOUT")) h->timeout=e->header_value;
+    }
+    return ESP_OK;
+}
+
 // One SUBSCRIBE/UNSUBSCRIBE round-trip. Returns the response headers of a 200.
 esp_err_t gena(esp_http_client_method_t method, const Subscription& sub,
                const std::string& callback_uri, std::string* sid, int* granted) {
@@ -56,6 +69,8 @@ esp_err_t gena(esp_http_client_method_t method, const Subscription& sub,
     esp_http_client_config_t config{};
     config.url=url.c_str(); config.timeout_ms=5000;
     config.disable_auto_redirect=true;
+    ResponseHeaders headers;
+    config.event_handler=on_header; config.user_data=&headers;
     auto client=esp_http_client_init(&config);
     if(!client) return ESP_FAIL;
     struct Cleanup { esp_http_client_handle_t h; ~Cleanup(){esp_http_client_cleanup(h);} } cleanup{client};
@@ -70,7 +85,11 @@ esp_err_t gena(esp_http_client_method_t method, const Subscription& sub,
         auto timeout="Second-"+std::to_string(REQUESTED_TIMEOUT_S);
         esp_http_client_set_header(client,"TIMEOUT",timeout.c_str());
     }
-    auto result=esp_http_client_perform(client);
+    // Sonos answers with headers only, no Content-Length, and closes; reading
+    // a body makes esp_http_client report incomplete data. The headers carry
+    // everything needed.
+    auto result=esp_http_client_open(client,0);
+    if(result==ESP_OK && esp_http_client_fetch_headers(client)<0) result=ESP_FAIL;
     if(result!=ESP_OK || esp_http_client_get_status_code(client)!=200) {
         ESP_LOGW(TAG,"%s %s on %s failed: %s (HTTP %d)",method==HTTP_METHOD_SUBSCRIBE?"subscribe":"unsubscribe",
                  sub.target.service.c_str(),sub.target.ip.c_str(),esp_err_to_name(result),
@@ -78,24 +97,25 @@ esp_err_t gena(esp_http_client_method_t method, const Subscription& sub,
         return result!=ESP_OK?result:ESP_FAIL;
     }
     if(sid) {
-        char* value=nullptr;
-        if(esp_http_client_get_header(client,"SID",&value)!=ESP_OK || !value) return ESP_FAIL;
-        *sid=value;
+        if(headers.sid.empty()) {
+            ESP_LOGW(TAG,"subscribe %s on %s: no SID in response",sub.target.service.c_str(),sub.target.ip.c_str());
+            return ESP_FAIL;
+        }
+        *sid=headers.sid;
     }
     if(granted) {
         *granted=REQUESTED_TIMEOUT_S;
-        char* value=nullptr;
-        if(esp_http_client_get_header(client,"TIMEOUT",&value)==ESP_OK && value) {
-            int seconds=0;
-            if(sscanf(value,"Second-%d",&seconds)==1 && seconds>0) *granted=seconds;
-        }
+        int seconds=0;
+        if(sscanf(headers.timeout.c_str(),"Second-%d",&seconds)==1 && seconds>0) *granted=seconds;
     }
     return ESP_OK;
 }
 
 // Drains and discards the request body (bounded), then answers 200 and reports
-// the service from the URI suffix. NOTIFYs from unknown subscriptions are
-// answered but not reported.
+// the service from the URI suffix. The SID is not checked: a speaker sends its
+// first NOTIFY as soon as it answers SUBSCRIBE, often before the SID is stored
+// here, and that first full-state event is the one that matters most. A stale
+// subscription costs at most one extra refresh.
 esp_err_t notify(httpd_req_t* req) {
     char scratch[512];
     size_t remaining=req->content_len, skipped=0;
@@ -105,14 +125,8 @@ esp_err_t notify(httpd_req_t* req) {
         remaining-=n; skipped+=n;
     }
     httpd_resp_send(req,nullptr,0);
-    char sid[128];
-    bool known=false;
-    if(httpd_req_get_hdr_value_str(req,"SID",sid,sizeof(sid))==ESP_OK) {
-        std::lock_guard<std::mutex> guard(lock);
-        for(auto& sub:subscriptions) if(sub.sid==sid) { known=true; break; }
-    }
     const char* service=strrchr(req->uri,'/');
-    if(known && service && service[1] && callback) callback(service+1);
+    if(service && service[1] && callback) callback(service+1);
     return ESP_OK;
 }
 
@@ -217,6 +231,9 @@ void events_start(void (*on_event)(const char*)) {
     config.uri_match_fn=httpd_uri_match_wildcard;
     config.max_uri_handlers=12; // /notify/* plus headroom for OTA and debug handlers
     config.lru_purge_enable=true;
+    // OTA flash writes and screenshot encoding run in this task; the 4 KB
+    // default overflowed during the first OTA upload on hardware.
+    config.stack_size=12288;
     if(auto err=httpd_start(&server,&config); err!=ESP_OK) {
         ESP_LOGE(TAG,"server start failed: %s",esp_err_to_name(err));
         return;

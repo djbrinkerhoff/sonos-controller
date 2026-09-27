@@ -7,6 +7,8 @@
 #include <atomic>
 #include <algorithm>
 #include <cstring>
+#include <memory>
+#include <new>
 
 namespace {
 const char* TAG="ota";
@@ -36,12 +38,14 @@ esp_err_t upload(httpd_req_t* req) {
         return answer(req,"500 Internal Server Error",esp_err_to_name(err));
     struct Abort { esp_ota_handle_t h; bool armed=true; ~Abort(){if(armed) esp_ota_abort(h);} } abort{ota};
 
-    char scratch[2048];
+    constexpr size_t CHUNK=4096;
+    std::unique_ptr<char[]> scratch(new (std::nothrow) char[CHUNK]);
+    if(!scratch) return answer(req,"500 Internal Server Error","out of memory");
     size_t remaining=req->content_len;
     while(remaining) {
-        int n=httpd_req_recv(req,scratch,std::min(remaining,sizeof(scratch)));
+        int n=httpd_req_recv(req,scratch.get(),std::min(remaining,CHUNK));
         if(n<=0) return answer(req,"400 Bad Request","upload interrupted");
-        if(auto err=esp_ota_write(ota,scratch,n); err!=ESP_OK)
+        if(auto err=esp_ota_write(ota,scratch.get(),n); err!=ESP_OK)
             return answer(req,"500 Internal Server Error",esp_err_to_name(err));
         remaining-=n;
     }

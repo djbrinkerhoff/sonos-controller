@@ -2,6 +2,11 @@
 #include "network.hpp"
 #include "sonos.hpp"
 #include "driver/jpeg_decode.h"
+#include "lvgl.h"
+// LVGL's lodepng.h declares its C++ overloads inside extern "C", which C++
+// cannot include; these are the two C entry points used here.
+extern "C" unsigned lodepng_decode32(unsigned char** out, unsigned* w, unsigned* h, const unsigned char* in, size_t insize);
+extern "C" const char* lodepng_error_text(unsigned code);
 #include "esp_crt_bundle.h"
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
@@ -189,6 +194,35 @@ Image decode_jpeg(const uint8_t* data, size_t size) {
     return img;
 }
 
+// Sonos hands back whatever the music service supplies; Apple Music art is PNG.
+// LVGL's copy of lodepng is modified: the "out" pointer it returns is an
+// lv_draw_buf_t* whose data holds R,G,B,A bytes, freed with
+// lv_draw_buf_destroy. Transparency is flattened onto the panel background.
+Image decode_png(const uint8_t* data, size_t size) {
+    unsigned char* out=nullptr; unsigned w=0, h=0;
+    const unsigned error=lodepng_decode32(&out,&w,&h,data,size);
+    auto* decoded=reinterpret_cast<lv_draw_buf_t*>(out);
+    struct Free { lv_draw_buf_t* p; ~Free() { if(p) lv_draw_buf_destroy(p); } } free_decoded{decoded};
+    if(error) throw std::runtime_error(std::string("PNG decode: ")+lodepng_error_text(error));
+    if(!decoded || !w || !h || w>4096 || h>4096) throw std::runtime_error("Artwork dimensions too large");
+    Image img;
+    img.w=w; img.h=h;
+    img.buffer.allocate(w*h*2);
+    img.buffer.size=w*h*2;
+    constexpr uint32_t bg_r=0x1e, bg_g=0x23, bg_b=0x28;
+    auto* dst=img.pixels();
+    for(uint32_t y=0;y<h;++y) {
+        const unsigned char* row=decoded->data+y*decoded->header.stride;
+        for(uint32_t x=0;x<w;++x) {
+            const unsigned char* p=row+x*4;
+            const uint32_t a=p[3];
+            const uint32_t r=(p[0]*a+bg_r*(255-a))/255, g=(p[1]*a+bg_g*(255-a))/255, b=(p[2]*a+bg_b*(255-a))/255;
+            dst[y*w+x]=((r>>3)<<11)|((g>>2)<<5)|(b>>3);
+        }
+    }
+    return img;
+}
+
 // 2x2 box filter, applied iteratively: cheap and visibly better than nearest
 // neighbour for large reductions.
 void halve(Image& img) {
@@ -232,9 +266,11 @@ Artwork fetch_artwork(const std::string& speaker_ip, const std::string& art_uri,
     const int64_t started = esp_timer_get_time();
     Body body;
     download(artwork_url(speaker_ip, art_uri), body);
-    if (body.size < 2 || body.data[0] != 0xFF || body.data[1] != 0xD8)
-        throw std::runtime_error("Unsupported artwork format");
-    Image img = decode_jpeg(body.data, body.size);
+    static const uint8_t png_magic[] = {0x89, 'P', 'N', 'G'};
+    Image img;
+    if (body.size >= 2 && body.data[0] == 0xFF && body.data[1] == 0xD8) img = decode_jpeg(body.data, body.size);
+    else if (body.size >= 4 && std::memcmp(body.data, png_magic, 4) == 0) img = decode_png(body.data, body.size);
+    else throw std::runtime_error("Unsupported artwork format");
     const uint32_t decoded_w = img.w, decoded_h = img.h;
     uint32_t tw = img.w, th = img.h;
     if (img.w > max_side || img.h > max_side) {
