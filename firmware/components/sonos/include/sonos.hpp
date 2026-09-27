@@ -14,10 +14,12 @@ struct Favorite {
     std::string id, title, uri, metadata, art, provider;
     bool radio = false;
 };
+struct QueueItem { int number; std::string title, artist, album, art; };
 struct State {
     std::string title, artist, album, art, playback, actions;
     int volume = 0;
     int group_volume = 0;
+    int track = 0;
     bool muted = false;
 };
 std::string escape(const std::string& value);
@@ -25,6 +27,7 @@ Fields parse_response(const std::string& xml);
 std::vector<Room> parse_rooms(const std::string& xml);
 Fields parse_services(const std::string& xml);
 std::vector<Favorite> parse_favorites(const std::string& xml, const Fields& services);
+std::vector<QueueItem> parse_queue(const std::string& didl, int first_number);
 std::string ipv4_from_url(const std::string& url);
 bool valid_ipv4(const std::string& ip);
 
@@ -33,8 +36,11 @@ public:
     explicit Client(Transport transport) : transport_(std::move(transport)) {}
     std::vector<Room> rooms(const std::string& seed);
     std::vector<Favorite> favorites(const std::string& seed);
+    // start is a 0-based queue index; items are numbered from start + 1.
+    std::vector<QueueItem> queue(const Room& room, int start, int count, int* total = nullptr);
     State state(const Room& room);
     void play_favorite(const Room& room, const Favorite& favorite);
+    void play_queue_track(const Room& room, int number);
     void transport(const Room& room, const std::string& action);
     void volume(const Room& room, int value, bool group = false);
     void mute(const Room& room, bool value);

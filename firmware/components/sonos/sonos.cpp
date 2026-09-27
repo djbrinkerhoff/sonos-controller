@@ -178,6 +178,23 @@ std::vector<Favorite> parse_favorites(const std::string& xml, const Fields& serv
     }
     return favorites;
 }
+std::vector<QueueItem> parse_queue(const std::string& didl, int first_number) {
+    tinyxml2::XMLDocument doc;
+    parse(doc, didl);
+    std::vector<QueueItem> items;
+    for (auto item = doc.RootElement()->FirstChildElement(); item; item = item->NextSiblingElement()) {
+        if (local(item->Name()) != "item") continue;
+        QueueItem q;
+        q.number = first_number++;
+        q.title = text(child(item, "title"));
+        q.artist = text(child(item, "creator"));
+        if (q.artist.empty()) q.artist = text(child(item, "artist"));
+        q.album = text(child(item, "album"));
+        q.art = text(child(item, "albumArtURI"));
+        items.push_back(std::move(q));
+    }
+    return items;
+}
 Fields Client::call(const std::string& ip, const std::string& service, const std::string& action, const Fields& fields) {
     if (!valid_ipv4(ip)) throw std::runtime_error("Invalid speaker address");
     std::string path, urn;
@@ -231,6 +248,16 @@ std::vector<Favorite> Client::favorites(const std::string& seed) {
     }
     throw std::runtime_error("Favorites exceed the 1000-item device limit");
 }
+std::vector<QueueItem> Client::queue(const Room& room, int start, int count, int* total) {
+    if (start < 0 || count < 1) throw std::runtime_error("Invalid queue range");
+    auto target = coordinator(room);
+    auto response = call(target.ip,"ContentDirectory","Browse",
+        {{"ObjectID","Q:0"},{"BrowseFlag","BrowseDirectChildren"},
+         {"Filter","dc:title,res,dc:creator,upnp:artist,upnp:album,upnp:albumArtURI"},
+         {"StartingIndex",std::to_string(start)},{"RequestedCount",std::to_string(std::min(count,100))},{"SortCriteria",""}});
+    if (total) *total = number(response.at("TotalMatches"));
+    return parse_queue(response.at("Result"), start + 1);
+}
 State Client::state(const Room& room) {
     auto target = coordinator(room);
     auto p = call(target.ip,"AVTransport","GetPositionInfo",{{"InstanceID","0"}});
@@ -243,6 +270,7 @@ State Client::state(const Room& room) {
     s.playback=t["CurrentTransportState"]; s.actions=a["Actions"];
     s.volume=number(v.at("CurrentVolume"),100); s.muted=m["CurrentMute"]=="1";
     s.group_volume=number(g.at("CurrentVolume"),100);
+    s.track=p["Track"].empty() ? 0 : number(p["Track"]);
     if (!p["TrackMetaData"].empty() && p["TrackMetaData"]!="NOT_IMPLEMENTED") {
         tinyxml2::XMLDocument doc; parse(doc,p["TrackMetaData"]);
         s.title=text(descendant(doc.RootElement(),"title"));
@@ -264,6 +292,16 @@ void Client::play_favorite(const Room& room, const Favorite& favorite) {
         call(target.ip,"AVTransport","SetAVTransportURI",{{"InstanceID","0"},{"CurrentURI","x-rincon-queue:"+target.id+"#0"},{"CurrentURIMetaData",""}});
         call(target.ip,"AVTransport","Seek",{{"InstanceID","0"},{"Unit","TRACK_NR"},{"Target",first}});
     }
+    call(target.ip,"AVTransport","Play",{{"InstanceID","0"},{"Speed","1"}});
+}
+void Client::play_queue_track(const Room& room, int number) {
+    if (number < 1) throw std::runtime_error("Invalid queue track number");
+    auto target=coordinator(room);
+    const auto uri="x-rincon-queue:"+target.id+"#0";
+    // If the source is already this queue, seeking alone avoids reloading it.
+    if (call(target.ip,"AVTransport","GetMediaInfo",{{"InstanceID","0"}})["CurrentURI"]!=uri)
+        call(target.ip,"AVTransport","SetAVTransportURI",{{"InstanceID","0"},{"CurrentURI",uri},{"CurrentURIMetaData",""}});
+    call(target.ip,"AVTransport","Seek",{{"InstanceID","0"},{"Unit","TRACK_NR"},{"Target",std::to_string(number)}});
     call(target.ip,"AVTransport","Play",{{"InstanceID","0"},{"Speed","1"}});
 }
 void Client::transport(const Room& room, const std::string& action) {

@@ -351,7 +351,7 @@ void group_volume_and_state() {
     sonos::Client client([&](const sonos::Request& request) {
         requests.push_back(request);
         if (request.action == "GetZoneGroupState") return topology("192.168.1.9", "RINCON_COORD");
-        if (request.action == "GetPositionInfo") return soap("<TrackMetaData>" + xml_escape(track) + "</TrackMetaData>");
+        if (request.action == "GetPositionInfo") return soap("<Track>7</Track><TrackMetaData>" + xml_escape(track) + "</TrackMetaData>");
         if (request.action == "GetTransportInfo") return soap("<CurrentTransportState>PLAYING</CurrentTransportState>");
         if (request.action == "GetCurrentTransportActions") return soap("<Actions>Play, Stop,Pause,Next</Actions>");
         if (request.action == "GetVolume") return soap("<CurrentVolume>12</CurrentVolume>");
@@ -371,12 +371,81 @@ void group_volume_and_state() {
     requests.clear();
     const auto state = client.state(satellite);
     expect(state.title == "Song" && state.artist == "Artist" && state.album == "Album" && state.art == "/art", "track metadata not parsed");
-    expect(state.playback == "PLAYING" && state.volume == 12 && state.muted && state.group_volume == 40, "state values not parsed");
+    expect(state.playback == "PLAYING" && state.volume == 12 && state.muted && state.group_volume == 40 && state.track == 7,
+           "state values not parsed");
     for (const auto& request : requests) {
         const bool room_level = request.action == "GetVolume" || request.action == "GetMute";
         if (request.action != "GetZoneGroupState")
             expect(request.ip == (room_level ? "192.168.1.3" : "192.168.1.9"), request.action + " sent to the wrong speaker");
     }
+
+    sonos::Client radio([&](const sonos::Request& request) {
+        if (request.action == "GetZoneGroupState") return topology();
+        if (request.action == "GetPositionInfo") return soap("<TrackMetaData>NOT_IMPLEMENTED</TrackMetaData>");
+        if (request.action == "GetVolume" || request.action == "GetGroupVolume") return soap("<CurrentVolume>1</CurrentVolume>");
+        return soap("");
+    });
+    const sonos::Room listener{"RINCON_SAT", "Satellite", "192.168.1.3", "RINCON_COORD"};
+    expect(radio.state(listener).track == 0, "missing queue track number not tolerated");
+}
+
+void queue_and_track_playback() {
+    const auto didl = "<DIDL-Lite>"
+        "<item><dc:title>One</dc:title><dc:creator>Artist A</dc:creator><upnp:album>Al</upnp:album><upnp:albumArtURI>/a</upnp:albumArtURI></item>"
+        "<item><dc:title>Two</dc:title><upnp:artist>Artist B</upnp:artist></item></DIDL-Lite>";
+    auto items = sonos::parse_queue(didl, 3);
+    expect(items.size() == 2 && items[0].number == 3 && items[1].number == 4, "queue items not numbered from first_number");
+    expect(items[0].title == "One" && items[0].artist == "Artist A" && items[0].album == "Al" && items[0].art == "/a",
+           "queue item fields not parsed");
+    expect(items[1].artist == "Artist B" && items[1].album.empty(), "upnp:artist fallback not used for queue items");
+    expect_throw([] { sonos::parse_queue("<broken>", 1); }, "malformed queue DIDL accepted");
+    expect_throw([] { sonos::parse_queue(std::string(512 * 1024 + 1, 'x'), 1); }, "oversized queue DIDL accepted");
+
+    std::vector<sonos::Request> requests;
+    std::string media_uri = "x-rincon-queue:RINCON_COORD#0";
+    sonos::Client client([&](const sonos::Request& request) {
+        requests.push_back(request);
+        if (request.action == "GetZoneGroupState") return topology();
+        if (request.action == "Browse")
+            return soap("<NumberReturned>2</NumberReturned><TotalMatches>37</TotalMatches><UpdateID>1</UpdateID><Result>" +
+                        xml_escape(didl) + "</Result>");
+        if (request.action == "GetMediaInfo") return soap("<CurrentURI>" + xml_escape(media_uri) + "</CurrentURI>");
+        return soap("");
+    });
+    const sonos::Room satellite{"RINCON_SAT", "Satellite", "192.168.1.3", "OLD_COORD"};
+
+    int total = 0;
+    const auto page = client.queue(satellite, 4, 250, &total);
+    expect(requests.size() == 2 && requests[1].action == "Browse" && requests[1].ip == "192.168.1.2",
+           "queue browse did not reach the live coordinator");
+    expect(argument_names(requests[1]) == std::vector<std::string>({"ObjectID", "BrowseFlag", "Filter", "StartingIndex", "RequestedCount", "SortCriteria"}),
+           "queue Browse SOAP argument order changed");
+    expect(requests[1].body.find("<ObjectID>Q:0</ObjectID>") != std::string::npos, "queue object ID not sent");
+    expect(requests[1].body.find("dc:title,res,dc:creator,upnp:artist,upnp:album,upnp:albumArtURI") != std::string::npos,
+           "queue browse filter changed");
+    expect(requests[1].body.find("<StartingIndex>4</StartingIndex>") != std::string::npos, "queue start index not sent");
+    expect(requests[1].body.find("<RequestedCount>100</RequestedCount>") != std::string::npos, "queue request not capped at 100");
+    expect(total == 37, "queue total not reported");
+    expect(page.size() == 2 && page[0].number == 5 && page[1].number == 6, "queue items not numbered from start + 1");
+    expect_throw([&] { client.queue(satellite, -1, 10); }, "negative queue start accepted");
+
+    requests.clear();
+    client.play_queue_track(satellite, 6);
+    expect(requests.size() == 3 && requests[0].action == "GetMediaInfo" && requests[1].action == "Seek" && requests[2].action == "Play",
+           "queue-track playback on the queue should inspect media, seek, then play");
+    expect(argument_names(requests[1]) == std::vector<std::string>({"InstanceID", "Unit", "Target"}), "Seek argument order changed");
+    expect(requests[1].body.find("<Unit>TRACK_NR</Unit>") != std::string::npos &&
+           requests[1].body.find("<Target>6</Target>") != std::string::npos, "seek target not sent");
+    expect(requests[2].body.find("<Speed>1</Speed>") != std::string::npos, "play speed not sent");
+
+    media_uri = "x-rincon:RINCON_OTHER";
+    requests.clear();
+    client.play_queue_track(satellite, 2);
+    expect(requests.size() == 4 && requests[0].action == "GetMediaInfo" && requests[1].action == "SetAVTransportURI" &&
+           requests[2].action == "Seek" && requests[3].action == "Play",
+           "non-queue source should switch to the queue URI before seeking");
+    expect(requests[1].body.find("x-rincon-queue:RINCON_COORD#0") != std::string::npos, "queue URI did not use coordinator ID");
+    expect_throw([&] { client.play_queue_track(satellite, 0); }, "queue track number below 1 accepted");
 }
 
 int main() {
@@ -388,6 +457,7 @@ int main() {
         update_changes_and_argument_order();
         grouping_and_areas();
         group_volume_and_state();
+        queue_and_track_playback();
         std::cout << "core tests passed (" << checks << " assertions)\n";
         return EXIT_SUCCESS;
     } catch (const std::exception& error) {
