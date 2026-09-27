@@ -41,9 +41,13 @@ public:
     void join(const Room& room, const Room& destination);
     void ungroup(const Room& room);
     void apply_area(const std::string& seed, const std::vector<std::string>& room_ids);
+    // Coordinator lookups reuse the last topology until this is called, a
+    // grouping change is made, or a room is missing from it.
+    void invalidate_topology() { topology_.clear(); }
 private:
     Transport transport_;
     Fields services_;
+    std::vector<Room> topology_;
     Fields call(const std::string& ip, const std::string& service,
                 const std::string& action, const Fields& fields = {});
     Room coordinator(const Room& room);

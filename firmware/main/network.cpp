@@ -123,6 +123,17 @@ bool speaker_reachable(const std::string& ip, int timeout_ms) {
     return error==0;
 }
 
+// One line a minute of speaker traffic, for load comparisons and soak tests.
+static void count_soap(size_t bytes) {
+    static int64_t window=0; static unsigned calls=0; static size_t total=0;
+    const int64_t now=esp_timer_get_time();
+    if(!window) window=now;
+    ++calls; total+=bytes;
+    if(now-window>=60000000) {
+        ESP_LOGI(TAG,"soap: %u calls, %u KB in the last %lld s",calls,static_cast<unsigned>(total/1024),(now-window)/1000000);
+        window=now; calls=0; total=0;
+    }
+}
 std::string soap_http(const sonos::Request& request) {
     if (!network_online()) throw std::runtime_error("Wi-Fi is disconnected");
     const auto url="http://"+request.ip+":1400"+request.path;
@@ -143,6 +154,7 @@ std::string soap_http(const sonos::Request& request) {
     check(esp_http_client_set_header(client,"SOAPACTION",action.c_str()),"SOAP action");
     check(esp_http_client_set_post_field(client,request.body.data(),request.body.size()),"SOAP body");
     auto result=esp_http_client_perform(client);
+    count_soap(body.xml.size());
     if(result!=ESP_OK) {
         ESP_LOGE(TAG,"soap: %s:%d %s failed: %s (received %zu bytes, status %d)",
                  request.ip.c_str(),1400,request.action.c_str(),esp_err_to_name(result),

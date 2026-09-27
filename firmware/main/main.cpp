@@ -351,7 +351,7 @@ void worker(void*) {
     auto boot=new Command; boot->action="Connect"; boot->ssid=setting("ssid"); boot->password=setting("password"); boot->seed=setting("seed");
     if(!boot->ssid.empty()) { if(xQueueSend(commands,&boot,0)!=pdTRUE) delete boot; }
     else { delete boot; status(storage_ok?"Open Settings to connect to your home Wi-Fi.":"Settings storage failed; settings will not be saved. Open Settings to connect."); }
-    TickType_t last_catalog_attempt=0;
+    TickType_t last_catalog_attempt=0, last_topology=0;
     for(;;) {
         Command* raw=nullptr;
         xQueueReceive(commands,&raw,pdMS_TO_TICKS(4000));
@@ -384,6 +384,10 @@ void worker(void*) {
                 else if(c->action=="Ungroup") {client.ungroup(c->room); refresh();}
                 else if(c->action!="Poll") client.transport(c->room,c->action);
             }
+            // External regrouping is picked up within 30 s even without events.
+            if(xTaskGetTickCount()-last_topology>pdMS_TO_TICKS(30000)) {
+                client.invalidate_topology(); last_topology=xTaskGetTickCount();
+            }
             sonos::Room target;
             {DisplayLock lock; target=selected;}
             if(!target.id.empty()) render_state(target,client.state(target));
@@ -391,6 +395,7 @@ void worker(void*) {
             // Drop queued actions after any failure; never replay a possibly completed queue mutation.
             Command* pending=nullptr;
             while(xQueueReceive(commands,&pending,0)==pdTRUE) delete pending;
+            client.invalidate_topology();
             status(e.what()); ESP_LOGE(TAG,"Controller operation failed: %s",e.what());
         }
     }

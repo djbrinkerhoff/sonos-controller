@@ -200,14 +200,18 @@ Fields Client::call(const std::string& ip, const std::string& service, const std
     return parse_response(transport_({ip, path, urn, action, body}));
 }
 std::vector<Room> Client::rooms(const std::string& seed) {
-    return parse_rooms(call(seed, "ZoneGroupTopology", "GetZoneGroupState").at("ZoneGroupState"));
+    topology_ = parse_rooms(call(seed, "ZoneGroupTopology", "GetZoneGroupState").at("ZoneGroupState"));
+    return topology_;
 }
 Room Client::coordinator(const Room& room) {
-    auto all = rooms(room.ip);
-    auto selected = std::find_if(all.begin(), all.end(), [&](const Room& r) { return r.id == room.id; });
-    if (selected == all.end()) throw std::runtime_error("Room is no longer available");
-    auto leader = std::find_if(all.begin(), all.end(), [&](const Room& r) { return r.id == selected->coordinator; });
-    if (leader == all.end()) throw std::runtime_error("Group coordinator is unavailable");
+    auto find = [](const std::vector<Room>& all, const std::string& id) {
+        return std::find_if(all.begin(), all.end(), [&](const Room& r) { return r.id == id; });
+    };
+    if (find(topology_, room.id) == topology_.end()) rooms(room.ip);
+    auto selected = find(topology_, room.id);
+    if (selected == topology_.end()) throw std::runtime_error("Room is no longer available");
+    auto leader = find(topology_, selected->coordinator);
+    if (leader == topology_.end()) throw std::runtime_error("Group coordinator is unavailable");
     return *leader;
 }
 std::vector<Favorite> Client::favorites(const std::string& seed) {
@@ -284,9 +288,11 @@ void Client::mute(const Room& room, bool value) {
 void Client::join(const Room& room, const Room& destination) {
     auto target=coordinator(destination);
     if(room.id==target.id) return;
+    invalidate_topology();
     call(room.ip,"AVTransport","SetAVTransportURI",{{"InstanceID","0"},{"CurrentURI","x-rincon:"+target.id},{"CurrentURIMetaData",""}});
 }
 void Client::ungroup(const Room& room) {
+    invalidate_topology();
     call(room.ip,"AVTransport","BecomeCoordinatorOfStandaloneGroup",{{"InstanceID","0"}});
 }
 void Client::apply_area(const std::string& seed, const std::vector<std::string>& ids) {

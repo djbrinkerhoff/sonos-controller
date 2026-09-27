@@ -156,6 +156,19 @@ void topology_and_coordinator() {
     expect(requests[1].ip == "192.168.1.9" && requests[1].action == "Play", "transport used the stale coordinator");
     expect(argument_names(requests[1]) == std::vector<std::string>({"InstanceID", "Speed"}), "Play SOAP argument order/values changed");
     expect_throw([&] { client.transport(satellite, "Reboot"); }, "unsupported transport action accepted");
+
+    requests.clear();
+    client.transport(satellite, "Pause");
+    client.transport(satellite, "Play");
+    expect(requests.size() == 2 && requests[0].action == "Pause" && requests[1].action == "Play",
+           "coordinator lookups did not reuse the cached topology");
+    client.invalidate_topology();
+    client.transport(satellite, "Pause");
+    expect(requests.size() == 4 && requests[2].action == "GetZoneGroupState", "invalidated topology was not refetched");
+    requests.clear();
+    const sonos::Room unknown{"RINCON_NEW", "New", "192.168.1.9", "RINCON_COORD"};
+    expect_throw([&] { client.transport(unknown, "Play"); }, "room missing from fresh topology was accepted");
+    expect(requests.size() == 1 && requests[0].action == "GetZoneGroupState", "room missing from cache did not force a refetch");
 }
 
 void commands_and_paging() {
