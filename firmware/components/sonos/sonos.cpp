@@ -253,6 +253,8 @@ void Client::play_favorite(const Room& room, const Favorite& favorite) {
     auto target=coordinator(room);
     if (favorite.radio) call(target.ip,"AVTransport","SetAVTransportURI",{{"InstanceID","0"},{"CurrentURI",favorite.uri},{"CurrentURIMetaData",favorite.metadata}});
     else {
+        // Replace the queue, matching the official app's "Replace Queue".
+        call(target.ip,"AVTransport","RemoveAllTracksFromQueue",{{"InstanceID","0"}});
         auto added=call(target.ip,"AVTransport","AddURIToQueue",{{"InstanceID","0"},{"EnqueuedURI",favorite.uri},{"EnqueuedURIMetaData",favorite.metadata},{"DesiredFirstTrackNumberEnqueued","0"},{"EnqueueAsNext","0"}});
         auto first=std::to_string(number(added.at("FirstTrackNumberEnqueued")));
         call(target.ip,"AVTransport","SetAVTransportURI",{{"InstanceID","0"},{"CurrentURI","x-rincon-queue:"+target.id+"#0"},{"CurrentURIMetaData",""}});
@@ -299,12 +301,14 @@ void Client::apply_area(const std::string& seed, const std::vector<std::string>&
         wanted.push_back(*it);
     }
     auto base=wanted.front();
-    bool outsiders=std::any_of(all.begin(),all.end(),[&](const Room& r){return r.coordinator==base.coordinator && !unique.count(r.id);});
+    const auto group=base.coordinator;
+    bool outsiders=std::any_of(all.begin(),all.end(),[&](const Room& r){return r.coordinator==group && !unique.count(r.id);});
     if(outsiders) ungroup(base);
     else {
-        auto leader=std::find_if(wanted.begin(),wanted.end(),[&](const Room& r){return r.id==base.coordinator;});
+        auto leader=std::find_if(wanted.begin(),wanted.end(),[&](const Room& r){return r.id==group;});
         if(leader!=wanted.end()) base=*leader;
     }
-    for(const auto& r:wanted) if(r.id!=base.id) join(r,base);
+    // Rooms already in the kept group need no join; re-sending one can drop audio.
+    for(const auto& r:wanted) if(r.id!=base.id && (outsiders || r.coordinator!=group)) join(r,base);
 }
 }

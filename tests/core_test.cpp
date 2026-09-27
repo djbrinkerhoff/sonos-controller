@@ -4,6 +4,8 @@
 #include <cstdlib>
 #include <functional>
 #include <iostream>
+#include <map>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -189,14 +191,27 @@ void commands_and_paging() {
     client.play_favorite(satellite, favorites.front());
     std::vector<sonos::Request> mutations;
     for (const auto& request : requests) if (request.action != "ListAvailableServices" && request.action != "Browse" && request.action != "GetZoneGroupState") mutations.push_back(request);
-    expect(mutations.size() == 4, "queued favorite should add, select queue, seek, then play");
-    expect(mutations[0].action == "AddURIToQueue" && mutations[0].ip == "192.168.1.2", "favorite was not queued on live coordinator");
-    expect(argument_names(mutations[0]) == std::vector<std::string>({"InstanceID", "EnqueuedURI", "EnqueuedURIMetaData", "DesiredFirstTrackNumberEnqueued", "EnqueueAsNext"}),
+    expect(mutations.size() == 5, "queued favorite should clear, add, select queue, seek, then play");
+    expect(mutations[0].action == "RemoveAllTracksFromQueue" && mutations[0].ip == "192.168.1.2", "queue was not cleared on live coordinator");
+    expect(mutations[1].action == "AddURIToQueue" && mutations[1].ip == "192.168.1.2", "favorite was not queued on live coordinator");
+    expect(argument_names(mutations[1]) == std::vector<std::string>({"InstanceID", "EnqueuedURI", "EnqueuedURIMetaData", "DesiredFirstTrackNumberEnqueued", "EnqueueAsNext"}),
            "AddURIToQueue SOAP argument order changed");
-    expect(mutations[1].action == "SetAVTransportURI" && mutations[2].action == "Seek" && mutations[3].action == "Play",
+    expect(mutations[2].action == "SetAVTransportURI" && mutations[3].action == "Seek" && mutations[4].action == "Play",
            "queue playback command sequence changed");
-    expect(mutations[1].body.find("x-rincon-queue:RINCON_COORD#0") != std::string::npos, "queue URI did not use coordinator ID");
-    expect(argument_names(mutations[3]) == std::vector<std::string>({"InstanceID", "Speed"}), "Play arguments were not ordered");
+    expect(mutations[2].body.find("x-rincon-queue:RINCON_COORD#0") != std::string::npos, "queue URI did not use coordinator ID");
+    expect(argument_names(mutations[4]) == std::vector<std::string>({"InstanceID", "Speed"}), "Play arguments were not ordered");
+
+    requests.clear();
+    const auto radio_md = metadata("775", "object.item.audioItem.audioBroadcast");
+    auto radio = sonos::parse_favorites("<DIDL-Lite><item><title>Station</title><res>x-sonosapi-stream:s1?sid=3</res><resMD>" +
+                                        xml_escape(radio_md) + "</resMD></item></DIDL-Lite>", {{"3", "Apple Music"}});
+    expect(radio.size() == 1 && radio[0].radio, "radio favorite fixture not recognized");
+    client.play_favorite(satellite, radio[0]);
+    mutations.clear();
+    for (const auto& request : requests) if (request.action != "GetZoneGroupState") mutations.push_back(request);
+    expect(mutations.size() == 2 && mutations[0].action == "SetAVTransportURI" && mutations[1].action == "Play",
+           "radio favorite should set the stream and play without touching the queue");
+    expect(mutations[0].body.find("x-sonosapi-stream:s1?sid=3") != std::string::npos, "radio stream URI not sent");
 }
 
 void update_changes_and_argument_order() {
@@ -229,6 +244,128 @@ void update_changes_and_argument_order() {
 }
 }
 
+// A small in-memory household: topology reflects join/ungroup mutations, so
+// multi-step grouping logic is exercised against changing coordinators.
+struct Household {
+    struct Member { std::string name, ip, coordinator; };
+    std::map<std::string, Member> rooms;
+    std::vector<sonos::Request> mutations;
+
+    std::string id_at(const std::string& ip) const {
+        for (const auto& [id, room] : rooms) if (room.ip == ip) return id;
+        throw std::runtime_error("request sent to unknown speaker " + ip);
+    }
+    std::string state() const {
+        std::map<std::string, std::string> groups;
+        for (const auto& [id, room] : rooms)
+            groups[room.coordinator] += "<ZoneGroupMember UUID=\"" + id + "\" ZoneName=\"" + room.name +
+                "\" Location=\"http://" + room.ip + ":1400/x\"/>";
+        std::string xml = "<ZoneGroups>";
+        for (const auto& [coordinator, members] : groups)
+            xml += "<ZoneGroup Coordinator=\"" + coordinator + "\">" + members + "</ZoneGroup>";
+        return soap("<ZoneGroupState>" + xml_escape(xml + "</ZoneGroups>") + "</ZoneGroupState>");
+    }
+    std::string operator()(const sonos::Request& request) {
+        if (request.action == "GetZoneGroupState") return state();
+        mutations.push_back(request);
+        const auto id = id_at(request.ip);
+        if (request.action == "BecomeCoordinatorOfStandaloneGroup") {
+            std::string heir;
+            for (auto& [other, room] : rooms) if (other != id && room.coordinator == id) {
+                if (heir.empty()) heir = other;
+                room.coordinator = heir;
+            }
+            rooms[id].coordinator = id;
+        } else if (request.action == "SetAVTransportURI") {
+            const std::string prefix = "x-rincon:";
+            auto at = request.body.find(prefix);
+            if (at != std::string::npos) rooms[id].coordinator = request.body.substr(at + prefix.size(), request.body.find('<', at) - at - prefix.size());
+        }
+        return soap("");
+    }
+    std::vector<std::string> log() const {
+        std::vector<std::string> result;
+        for (const auto& m : mutations) result.push_back(m.action + "@" + id_at(m.ip));
+        return result;
+    }
+    sonos::Room room(const std::string& id) const {
+        const auto& r = rooms.at(id);
+        return {id, r.name, r.ip, r.coordinator};
+    }
+};
+
+void grouping_and_areas() {
+    auto household = std::make_shared<Household>();
+    household->rooms = {{"A", {"Kitchen", "10.0.0.1", "A"}}, {"B", {"Den", "10.0.0.2", "A"}},
+                        {"C", {"Patio", "10.0.0.3", "C"}}, {"D", {"Office", "10.0.0.4", "D"}}};
+    sonos::Client client([household](const sonos::Request& r) { return (*household)(r); });
+
+    client.join(household->room("C"), household->room("B"));
+    expect(household->rooms["C"].coordinator == "A", "join did not target the destination's coordinator");
+    expect(household->mutations.back().body.find("x-rincon:A<") != std::string::npos, "join URI did not name the coordinator");
+    household->mutations.clear();
+    client.join(household->room("A"), household->room("B"));
+    expect(household->mutations.empty(), "joining a coordinator to its own group sent a command");
+
+    client.ungroup(household->room("C"));
+    expect(household->log() == std::vector<std::string>({"BecomeCoordinatorOfStandaloneGroup@C"}), "ungroup was not sent to the room itself");
+    household->mutations.clear();
+
+    // Area {B, D}: A is an outsider in B's group, so B leaves it and D joins B.
+    client.apply_area("10.0.0.1", {"B", "D"});
+    expect(household->log() == std::vector<std::string>({"BecomeCoordinatorOfStandaloneGroup@B", "SetAVTransportURI@D"}),
+           "area with an outsider should split off the first room, then join the rest");
+    expect(household->rooms["B"].coordinator == "B" && household->rooms["D"].coordinator == "B" && household->rooms["A"].coordinator == "A",
+           "area membership was not restored");
+    household->mutations.clear();
+
+    // Area {D, B, C}: B already leads {B, D}; only C needs to join, and to B.
+    client.apply_area("10.0.0.1", {"D", "B", "C", "B"});
+    expect(household->log() == std::vector<std::string>({"SetAVTransportURI@C"}),
+           "area should keep the existing coordinator and skip rooms already grouped");
+    expect(household->rooms["C"].coordinator == "B", "area room joined the wrong coordinator");
+    household->mutations.clear();
+
+    expect_throw([&] { client.apply_area("10.0.0.1", {"B", "MISSING"}); }, "area with an unavailable room was applied");
+    expect(household->mutations.empty(), "unavailable area room still changed grouping");
+    expect_throw([&] { client.apply_area("10.0.0.1", {}); }, "empty area was applied");
+}
+
+void group_volume_and_state() {
+    std::vector<sonos::Request> requests;
+    const std::string track = "<DIDL-Lite><item><dc:title>Song</dc:title><dc:creator>Artist</dc:creator>"
+        "<upnp:album>Album</upnp:album><upnp:albumArtURI>/art</upnp:albumArtURI></item></DIDL-Lite>";
+    sonos::Client client([&](const sonos::Request& request) {
+        requests.push_back(request);
+        if (request.action == "GetZoneGroupState") return topology("192.168.1.9", "RINCON_COORD");
+        if (request.action == "GetPositionInfo") return soap("<TrackMetaData>" + xml_escape(track) + "</TrackMetaData>");
+        if (request.action == "GetTransportInfo") return soap("<CurrentTransportState>PLAYING</CurrentTransportState>");
+        if (request.action == "GetCurrentTransportActions") return soap("<Actions>Play, Stop,Pause,Next</Actions>");
+        if (request.action == "GetVolume") return soap("<CurrentVolume>12</CurrentVolume>");
+        if (request.action == "GetMute") return soap("<CurrentMute>1</CurrentMute>");
+        if (request.action == "GetGroupVolume") return soap("<CurrentVolume>40</CurrentVolume>");
+        return soap("");
+    });
+    const sonos::Room satellite{"RINCON_SAT", "Satellite", "192.168.1.3", "RINCON_COORD"};
+
+    client.volume(satellite, 30, true);
+    expect(requests.size() == 3 && requests[1].action == "SnapshotGroupVolume" && requests[2].action == "SetGroupVolume",
+           "group volume should snapshot, then set");
+    expect(requests[1].ip == "192.168.1.9" && requests[2].ip == "192.168.1.9", "group volume did not target the coordinator");
+    expect(argument_names(requests[2]) == std::vector<std::string>({"InstanceID", "DesiredVolume"}), "SetGroupVolume arguments changed");
+    expect(requests[2].body.find("<DesiredVolume>30</DesiredVolume>") != std::string::npos, "group volume value missing");
+
+    requests.clear();
+    const auto state = client.state(satellite);
+    expect(state.title == "Song" && state.artist == "Artist" && state.album == "Album" && state.art == "/art", "track metadata not parsed");
+    expect(state.playback == "PLAYING" && state.volume == 12 && state.muted && state.group_volume == 40, "state values not parsed");
+    for (const auto& request : requests) {
+        const bool room_level = request.action == "GetVolume" || request.action == "GetMute";
+        if (request.action != "GetZoneGroupState")
+            expect(request.ip == (room_level ? "192.168.1.3" : "192.168.1.9"), request.action + " sent to the wrong speaker");
+    }
+}
+
 int main() {
     try {
         parsing_and_validation();
@@ -236,6 +373,8 @@ int main() {
         topology_and_coordinator();
         commands_and_paging();
         update_changes_and_argument_order();
+        grouping_and_areas();
+        group_volume_and_state();
         std::cout << "core tests passed (" << checks << " assertions)\n";
         return EXIT_SUCCESS;
     } catch (const std::exception& error) {

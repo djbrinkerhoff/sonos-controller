@@ -15,7 +15,7 @@ Implemented:
 - Group/ungroup rooms and up to eight saved areas. Group the desired rooms, name the current group, and save it; apply a saved area to restore its membership.
 - On-device Wi-Fi setup, manual speaker IP fallback, persistent settings and areas.
 - Network work on a separate FreeRTOS task, bounded XML responses and paginated favorites, periodic state refresh, fresh coordinator lookup before group playback actions.
-- Favorite playback appends to the existing queue and seeks to the newly added item. Radio favorites use their supplied stream URI/metadata. A failed operation is not automatically replayed.
+- Favorite playback replaces the queue (like the official app's "Replace Queue") and starts it. Radio favorites use their supplied stream URI/metadata. A failed operation is not automatically replayed.
 - Read-only Python compatibility probe and host tests for the shared C++ Sonos protocol code.
 
 Still to implement/validate before daily-use release: artwork rendering, queue browser/editing, screen dim/sleep/wake and battery/charging integration, signed OTA/rollback, stronger credential storage, automatic recovery after speaker IP changes, event subscriptions, layout QA on the real screen and a multi-day soak test. Wi-Fi credentials currently live in ordinary device NVS; no secrets belong in source control. The initial factory partition layout has no OTA slots.

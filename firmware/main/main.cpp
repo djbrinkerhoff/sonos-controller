@@ -44,6 +44,8 @@ lv_obj_t *group_slider,*group_label,*area_name,*area_list;
 struct Area {std::string name; std::vector<std::string> ids;};
 std::vector<Area> areas;
 bool initialized=false;
+bool storage_ok=true;
+bool catalog_loaded=false;
 
 struct DisplayLock { DisplayLock(){bsp_display_lock(0);} ~DisplayLock(){bsp_display_unlock();} };
 std::string setting(const char* key) {
@@ -98,6 +100,22 @@ void save_settings(const Command& command) {
     if(result==ESP_OK) result=nvs_commit(handle);
     nvs_close(handle);
     if(result!=ESP_OK) throw std::runtime_error("Settings could not be saved");
+}
+// Every visible room's IP from the last good topology, so a stale seed or a
+// powered-off speaker does not strand the controller; SSDP is the last resort.
+std::vector<std::string> known_speakers() {
+    std::istringstream stream(setting("speakers")); std::vector<std::string> ips; std::string ip;
+    while(std::getline(stream,ip)) if(sonos::valid_ipv4(ip)) ips.push_back(ip);
+    return ips;
+}
+void save_known_speakers(const std::vector<sonos::Room>& found) {
+    std::string value;
+    for(size_t i=0;i<found.size() && i<32;++i) value+=(i?"\n":"")+found[i].ip;
+    if(value.empty() || value==setting("speakers")) return; // spare flash writes
+    nvs_handle_t handle;
+    if(nvs_open("controller",NVS_READWRITE,&handle)!=ESP_OK) return;
+    if(nvs_set_str(handle,"speakers",value.c_str())==ESP_OK) nvs_commit(handle);
+    nvs_close(handle);
 }
 void status(const std::string& text) { DisplayLock lock; lv_label_set_text(status_label,text.c_str()); }
 void enqueue(Command* command) {
@@ -302,9 +320,24 @@ void build_ui() {
     if(setting("ssid").empty()) lv_tabview_set_active(tabs,3,LV_ANIM_OFF);
 }
 void refresh() {
-    if(seed.empty()) seed=discover_speaker();
-    auto r=client.rooms(seed); auto f=client.favorites(seed);
-    render_catalog(std::move(r),std::move(f));
+    if(!network_online()) throw std::runtime_error("Wi-Fi is disconnected");
+    std::vector<std::string> candidates;
+    for(const auto& ip:{seed,setting("seed")}) if(!ip.empty()) candidates.push_back(ip);
+    for(const auto& ip:known_speakers()) candidates.push_back(ip);
+    std::vector<sonos::Room> found;
+    std::vector<std::string> tried;
+    for(const auto& ip:candidates) {
+        if(std::find(tried.begin(),tried.end(),ip)!=tried.end()) continue;
+        tried.push_back(ip);
+        if(!speaker_reachable(ip,1500)) continue;
+        try { found=client.rooms(ip); seed=ip; break; }
+        catch(const std::exception& e) { ESP_LOGW(TAG,"Speaker %s unusable: %s",ip.c_str(),e.what()); }
+    }
+    if(found.empty()) { seed=discover_speaker(); found=client.rooms(seed); }
+    save_known_speakers(found);
+    auto f=client.favorites(seed);
+    render_catalog(std::move(found),std::move(f));
+    catalog_loaded=true;
 }
 void worker(void*) {
     try {
@@ -314,17 +347,26 @@ void worker(void*) {
     }
     catch(const std::exception& e) { status(e.what()); ESP_LOGE(TAG,"Startup failed: %s",e.what()); }
     auto boot=new Command; boot->action="Connect"; boot->ssid=setting("ssid"); boot->password=setting("password"); boot->seed=setting("seed");
-    if(!boot->ssid.empty()) xQueueSend(commands,&boot,0); else {delete boot; status("Open Settings to connect to your home Wi-Fi.");}
+    if(!boot->ssid.empty()) { if(xQueueSend(commands,&boot,0)!=pdTRUE) delete boot; }
+    else { delete boot; status(storage_ok?"Open Settings to connect to your home Wi-Fi.":"Settings storage failed; settings will not be saved. Open Settings to connect."); }
+    TickType_t last_catalog_attempt=0;
     for(;;) {
         Command* raw=nullptr;
         xQueueReceive(commands,&raw,pdMS_TO_TICKS(4000));
         std::unique_ptr<Command> c(raw);
         try {
+            // A boot-time connect can fail while the router is down; the Wi-Fi
+            // layer keeps retrying, so load the catalog once it comes back.
+            if(!c && initialized && !catalog_loaded && network_online() &&
+               xTaskGetTickCount()-last_catalog_attempt>pdMS_TO_TICKS(30000)) {
+                last_catalog_attempt=xTaskGetTickCount();
+                refresh();
+            }
             if(c) {
                 if(!initialized) throw std::runtime_error("Wi-Fi hardware failed to initialize. Restart the controller.");
                 if(c->action=="Connect") {
                     if(!c->seed.empty() && !sonos::valid_ipv4(c->seed)) throw std::runtime_error("Enter a valid speaker IPv4 address");
-                    status("Connecting to Wi-Fi..."); network_connect(c->ssid,c->password); save_settings(*c); seed=c->seed; refresh();
+                    status("Connecting to Wi-Fi..."); network_connect(c->ssid,c->password); if(storage_ok) save_settings(*c); seed=c->seed; refresh();
                 } else if(c->action=="Refresh") refresh();
                 else if(c->action=="Favorite") client.play_favorite(c->room,c->favorite);
                 else if(c->action=="Volume") client.volume(c->room,c->value);
@@ -455,8 +497,10 @@ static void await_touch_controller() {
 }
 
 extern "C" void app_main() {
+    // Never erase on failure: that would destroy saved settings. Boot without
+    // persistence instead, so the device does not look bricked.
     auto nvs=nvs_flash_init();
-    if(nvs!=ESP_OK) { ESP_LOGE(TAG,"NVS init failed: %s (settings preserved)",esp_err_to_name(nvs)); return; }
+    if(nvs!=ESP_OK) { ESP_LOGE(TAG,"NVS init failed: %s (settings preserved)",esp_err_to_name(nvs)); storage_ok=false; }
 #ifdef CONFIG_TAB5_I2C_SCAN
     i2c_scan_diagnostic();
     return;

@@ -2,6 +2,22 @@
 
 Updated September 26, 2026 (second pass, same day). The device is now flashed, booting, on Wi-Fi, and talking to the real household speakers. The board bring-up blockers are resolved; the unproven product milestone is now audible playback.
 
+## Session 3: review fixes (not yet flashed)
+
+Code review changes, built and host-tested but **not yet run on the Tab5**:
+
+- **Speaker fallback.** Every visible room IP from the last good topology is saved to NVS (`speakers` key). `refresh()` tries the current seed, the manual seed, then each saved IP (each behind a bounded 1.5 s TCP check), and only then SSDP. A stale or powered-off seed no longer strands the controller.
+- **SSDP** now listens against one 4 s deadline with `MX: 2` and three spaced sends, instead of quitting at the first quiet second. Wi-Fi power save is disabled (`WIFI_PS_NONE`) as a suspected cause of missed replies; revisit with battery/sleep work. Discovery logs the time and number of sends it took.
+- **TCP reachability probe** now runs only after a failed SOAP call (previously before every call, ~7 extra connects per 4 s poll), and uses a non-blocking connect so it is actually bounded.
+- **SOAP timeout** reduced from 30 s to 5 s. `esp_http_client` applies it per connect/read, not per transfer.
+- **Wi-Fi reconnect** moved off the event loop into a task with 1 s→60 s exponential backoff. A boot-time connect that fails (router down) now recovers, and the worker loads the catalog once Wi-Fi returns (retried at most every 30 s).
+- **NVS init failure** now boots the UI without persistence and says so, instead of a black screen.
+- **Favorite playback replaces the queue** (`RemoveAllTracksFromQueue` first), per user decision.
+- **`apply_area`** no longer re-sends a join to rooms already in the kept group.
+- **Tests:** 67 native assertions (was 40), adding join/ungroup, saved areas against a simulated household, group volume, radio playback and `state()`.
+
+To verify on hardware: cold boot with the `seed` key cleared, SSDP timing in the log, Wi-Fi recovery after an access-point restart, replace-queue behavior, and saved areas.
+
 ## Session 2: hardware bring-up (what changed)
 
 The Tab5 appeared on USB as `/dev/cu.usbmodem2101` once the user attached it with a data cable.
@@ -33,7 +49,7 @@ ESP_ERR_HTTP_INCOMPLETE_DATA (received 1440 bytes, status 200)
 
 Restoring the vendor defaults fixed it completely. This would have been misdiagnosed as flaky Wi-Fi without the byte-count logging.
 
-**Diagnostics added (keep these).** `catch` blocks now log `e.what()` instead of only painting it on screen — the first failure was unreadable without this. `log_tcp_reachability()` does a raw-socket probe before each SOAP call, which is what separated "network cannot reach the speaker" from "HTTP client misbehaved". SOAP failures now log action, error, bytes received, and HTTP status.
+**Diagnostics added (keep these).** `catch` blocks now log `e.what()` instead of only painting it on screen — the first failure was unreadable without this. `speaker_reachable()` does a raw-socket probe after a failed SOAP call (before every call until session 3), which is what separated "network cannot reach the speaker" from "HTTP client misbehaved". SOAP failures now log action, error, bytes received, and HTTP status.
 
 ## Validation status after session 2
 
@@ -49,9 +65,9 @@ Restoring the vendor defaults fixed it completely. This would have been misdiagn
 
 ## Open items
 
-- **SSDP discovery is unreliable** and is the main outstanding protocol bug. Everything currently works via a seeded manual IP, which is a stopgap: the address goes stale if the router reassigns it. Needs a real fix before this is an appliance.
+- **SSDP discovery was unreliable.** Session 3 changed the listen window and power save and added a saved-IP fallback; hardware confirmation is pending.
 - The seeded `seed` IP is still present in device NVS and should be cleared once discovery is fixed.
-- `timeout_ms` is now 30 s for SOAP. That is generous, not measured; revisit once discovery is stable.
+- SOAP `timeout_ms` is 5 s per network operation (session 3); confirm on hardware that large favorites/topology replies stay comfortably inside it.
 - Artwork is parsed but not rendered. Queue browser/editing, battery/charging, dim/sleep/wake, OTA signing/rollback, and soak testing remain.
 - Wi-Fi credentials live in ordinary NVS. Production credential protection remains.
 - State is polled every four seconds, not event-subscribed. Reconnect/IP-change recovery needs hardening.
@@ -137,7 +153,7 @@ Build log: `artifacts/firmware-build.log`. Some local incremental builds can run
 
 - ESP-IDF cross-compilation: **passed**, including application, bootloader and partition-size check for the default legacy P4 target.
 - Live read-only Sonos discovery/metadata: **passed**.
-- Native C++ tests: **passed, 40 assertions**, via `bash tools/test_core.sh`.
+- Native C++ tests: **passed, 67 assertions** (session 3), via `bash tools/test_core.sh`.
 - Python probe tests: **passed, 9 tests**, via `python3 -m unittest discover -s tests -p 'test_*.py'`.
 - Tab5 flash, cold boot, touch, Wi-Fi association, and SOAP exchange with a real speaker: **passed** (see session 2).
 - Audible playback and grouping/volume mutations: **not performed**. This is the remaining unproven milestone.
@@ -147,7 +163,7 @@ Build log: `artifacts/firmware-build.log`. Some local incremental builds can run
 - This is a bring-up prototype, not a finished appliance. Artwork is parsed but not rendered. Queue browser/editing, battery/charging management, dim/sleep/wake, OTA signing/rollback, and soak testing remain.
 - Wi-Fi credentials live in ordinary NVS for now. Source/report secrets are excluded from Git; production credential protection remains.
 - State is polled every four seconds, not event-subscribed. Reconnect/IP-change recovery needs hardening. If an existing seed IP becomes stale, discovery/manual IP refresh may be necessary.
-- Playback targets the selected room's current coordinator, resolved fresh. Favorite queue content is appended, then the newly added item is selected; the prior queue is not cleared. Radio uses preserved URI/metadata.
+- Playback targets the selected room's current coordinator, resolved fresh. Favorite playback clears the queue, adds the favorite, and plays from its first track. Radio uses preserved URI/metadata.
 - A failed action is not retried automatically; pending queued actions are dropped on error. Partial queue/grouping operations can still have happened before a timeout. The next step should verify actual state before another mutation.
 - Areas store stable room IDs. The app saves the selected room's current group; applying an area verifies all saved rooms exist before grouping and excludes outsiders from the restored group. Hardware tests must confirm expected coordinator/music behavior.
 - Source filtering fails closed. Unknown/conflicting identities and non-playable promotional favorites are excluded. The controller can display neutral state and stop/adjust volume for content started by another app.
@@ -157,7 +173,7 @@ Build log: `artifacts/firmware-build.log`. Some local incremental builds can run
 
 1. Read this handoff. Inspect current files before changing anything; agents share this directory.
 2. **Finish the playback validation matrix.** Apple Music favorites are proven; still untested are the Sonos Radio favorite ("Set The Table"), room/group volume, grouping/ungrouping, saved areas, queue viewing, and whether external changes made in the official app are reflected. Test every speaker model actually present, not just the one used so far.
-3. **Fix SSDP auto-discovery.** It is intermittent and is the main outstanding protocol bug. Playback currently depends on a seeded manual IP, so the product does not yet work from a cold boot with no stored address; that address also goes stale if the router reassigns it. Clear the `seed` key from NVS once discovery is reliable.
+3. **Confirm SSDP auto-discovery on hardware** after the session 3 changes. It was intermittent. Playback currently depends on a seeded manual IP, so the product does not yet work from a cold boot with no stored address; that address also goes stale if the router reassigns it. Clear the `seed` key from NVS once discovery is reliable.
 4. Fix any board/protocol issues observed before expanding UI/features. Then finish the appliance work listed above.
 
 Commands from project root:
