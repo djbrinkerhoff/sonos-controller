@@ -13,6 +13,23 @@ config TAB5_OFF_SECONDS
         Idle means no touch and no motion from the IMU. Music keeps playing;
         state polling pauses while the backlight is off.
 
+config TAB5_DEEP_OFF_MINUTES
+    int "Minutes after the backlight turns off before the display sleeps"
+    default 10
+    help
+        Until then a tap wakes the screen. After it, the display stream stops
+        (about 17 mA less) and only picking the device up wakes it: the touch
+        controller shares the panel's chip and stops scanning.
+
+config TAB5_STANDBY_MINUTES
+    int "Minutes with the screen off and nothing playing before standby"
+    # Standby also waits for the display to sleep (TAB5_DEEP_OFF_MINUTES).
+    default 10
+    help
+        Standby stops Wi-Fi and light-sleeps until the device is picked up or
+        touched; waking then takes a few seconds to rejoin the network. 0
+        disables standby.
+
 config TAB5_DIM_PERCENT
     int "Dimmed brightness percent"
     default 15

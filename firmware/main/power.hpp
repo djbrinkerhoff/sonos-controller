@@ -11,11 +11,18 @@ struct Battery {
     int pack_mv = 0;
     int percent = 0;
     int current_ma = 0;  // positive while charging (M5Unified convention)
-    bool charging = false;
+    bool charging = false;  // current flowing into the pack
 };
 Battery battery_read();
+// Mean pack discharge current (mA) over the window, for power measurements.
+int power_measure_ma(int seconds, int* low = nullptr, int* high = nullptr);
 
 // Starts a low-priority IMU poll task; on_motion runs on that task and must
 // be cheap. Logs and returns without a task if the BMI270 is absent.
 void motion_start(void (*on_motion)());
 bool motion_active();
+void motion_pause(bool paused);
+// Light-sleeps the chip until the device moves or is touched, or limit_ms
+// passes (0: no limit), then calls the motion callback so the screen wakes.
+// Stop Wi-Fi first. Blocks the caller; returns what woke it.
+const char* power_standby(int limit_ms = 0);

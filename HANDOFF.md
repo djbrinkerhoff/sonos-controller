@@ -2,6 +2,86 @@
 
 Updated September 26, 2026 (second pass, same day). The device is now flashed, booting, on Wi-Fi, and talking to the real household speakers. The board bring-up blockers are resolved; the unproven product milestone is now audible playback.
 
+## Lessons learned (all sessions)
+
+The details are in the session sections below. These are the rules they add up to.
+
+**Verifying on hardware**
+- **Software checks cannot see the glass.** After the screen woke, the panel's status register read "display on", `/panel` showed the right framebuffer and `/tap` woke the UI, yet the screen was dark. Any change to panel power, the DSI link or the flush path needs a person to look at the screen before it is called done.
+- **Simulated input is not real input.** `/tap` goes through LVGL, not the touch controller, so it passed while real taps did nothing (the touch controller sleeps without the video stream). Test wake paths with a real finger and a real pick-up.
+- **Ask the person for quick, specific checks** ("it is off now, tap once without moving it"). A forced state (`/power?off=1|2`) makes each check take seconds instead of a 3-minute timeout. When a check fails, read `/log` before guessing: it showed the wake had happened and only the picture was missing.
+
+**Measuring**
+- **Measure before changing and after.** The battery work only found where the current went (the Wi-Fi radio at full power, the display stream, the CPU clock) by switching one thing at a time with the INA226 (`/power`). Several obvious suspects measured as nothing (IMU polling, LVGL, stopping the radio instead of modem sleep).
+- **Battery current needs the USB cable unplugged.** On USB the system runs from USB and the pack current reads 0 (or the charge current).
+- **Control the variables.** Mid-measurement, the screen timer dimmed the backlight and made a whole run worthless; an earlier UI ablation was invalid because zsh does not word-split `set -- $var` (use `bash script.sh`). Pin every state you are not testing.
+- **Timestamps can lie.** The log tick does not advance in manual light sleep, and uptime that is shorter than expected means the device restarted. Read `Reset reason` at boot: 3 is a software restart (OTA), 6 is the task watchdog.
+
+**Keeping the device recoverable**
+- **Never run a risky experiment on the device when nobody is there to reset it.** A diagnostic DSI read hung the HTTP server, so no OTA could get through, and the device sat dark and unreachable for hours while the user was away.
+- **ESP-IDF's DSI code has no timeouts.** A read the panel cannot answer (for example with the lanes in ULPS) spins forever. `CONFIG_ESP_TASK_WDT_PANIC` now turns any 5 s stall into a restart; keep it on.
+- **The build script's exit status is not enough.** `build | grep` succeeds on an error line, so a failed build silently redeployed the previous image. Check for "Project build complete" before deploying.
+- **Recovery over USB:** opening the serial port resets the chip. If it then sits at "waiting for download" (`boot:0x204`), `esptool --after watchdog_reset read_mac` starts the app. Opening the port with DTR and RTS preset low avoids the download-mode strap.
+
+**Platform facts (Tab5, ESP32-P4, LVGL 9.4)**
+- The ST7121 is a TDDI: display and touch share one chip. Touch scans only while the video stream runs. After panel sleep (SLPIN) a short SLPOUT/DISPON does not bring the image back; only a full reset and init (1.1 s) does. So the screen is switched off with DISPOFF, never slept.
+- The DPI driver holds `ESP_PM_CPU_FREQ_MAX` while it exists. Deleting it (display asleep) is what lets frequency scaling drop the CPU to 40 MHz; recreating it restarts the stream at the top of a frame.
+- PSRAM bandwidth is the scarce resource: the display stream reads 110 MB/s, scrolled covers about 1 MB a frame. Aligned rows (LVGL's `lv_memcpy` goes byte-at-a-time when misaligned), 128-byte cache lines and fewer widgets were the wins. Several plausible hardware-offload ideas (PPA draw unit, PSRAM draw buffer, two draw units) measured slower.
+- `CHG_STAT` reads high on battery too. The BSP's Wi-Fi power-on resets the charger pins (fixed in `power_init()`). The C6 costs 16 mA even with its radio stopped, but powering it off needs a restart to recover esp_hosted.
+- Multicast SSDP is unreliable on this mesh; mDNS (link-local) is not.
+
+## Session 9: battery life
+
+Measured on battery with the INA226 through a new `/power` endpoint (mean pack current, discharge positive, back-to-back 141 ms shunt averages). On USB power the pack current reads 0 even with charging disabled: the system then runs from USB, so battery work needs the cable unplugged.
+
+**Where the screen-off current went (pack at ~8 V, measured step by step):**
+
+| State | mA |
+|---|---|
+| Backlight 100 % | 254 |
+| Backlight 15 % (dim) | 183 |
+| Screen "off" before this session (backlight 0 only) | 136 |
+| + Wi-Fi `WIFI_PS_MAX_MODEM` (was `NONE`) | 113 |
+| + DPI stream stopped and panel in sleep mode (SLPIN) | 92 |
+| + DSI video mode off and lanes in ULPS | ~87 |
+| + CPU 40 MHz (was 360) | ~78 |
+| IMU polling off | no change |
+| LVGL paused | no change |
+| Radio stopped instead of modem sleep | -2 |
+| P4 in light sleep, radio stopped | 54 |
+| + C6 unpowered (WLAN_PWR_EN low) | 38 |
+| + LCD and touch held in reset | 39 (no gain) |
+
+**Result (measured on battery):**
+
+| State | Wake by | mA |
+|---|---|---|
+| Awake, backlight 100 % | | 226 |
+| Screen off before this session | tap or motion | 136 |
+| Off: backlight 0, Wi-Fi max modem sleep, stream running | tap or motion | 110 |
+| Deep: + DISPOFF, DPI driver deleted, CPU 40 MHz | motion only | 85 |
+| Standby: + Wi-Fi stopped, light sleep, IMU checked every 200 ms | motion only | 39 |
+
+The user chose tiers: dim at 1 min, off at 3 min, deep `CONFIG_TAB5_DEEP_OFF_MINUTES` (10) later, and standby at that point if the selected room has not been playing for `CONFIG_TAB5_STANDBY_MINUTES` (10) with the screen dark. While dark, the worker checks playback on each speaker event (or every 5 min) with the two-call `summary()`.
+
+**How deep works (`display_power.cpp`):** DISPOFF, delete the DPI driver (stops the 110 MB/s PSRAM stream and releases its `ESP_PM_CPU_FREQ_MAX` lock; `CONFIG_PM_ENABLE` with `esp_pm_configure(360, 40)` then lets the CPU idle at 40 MHz), and put the DSI host in command mode with the clock lane in LP. Waking recreates the ST7121 DPI driver with a single DISPON (76 ms including the full redraw), which also starts the stream at the top of a frame. The DSI bus handle comes from the DPI driver's private struct prefix (pinned ESP-IDF 5.5.3).
+
+**What failed on the real glass (the panel status register said "on" every time; only the user's eyes caught it):**
+- **Panel sleep (SLPIN) then SLPOUT + DISPON:** the glass stayed dark. Only a software reset plus the BSP's full 21-command init (1.1 s) brought it back. So the panel is switched off, never slept (costs ~14 mA).
+- **ULPS on the DSI lanes:** after exiting ULPS the wake commands never reached the panel, and a DSI read then spun forever. Dropped (~5 mA).
+- **Touch while the stream is stopped:** the ST7121 is a TDDI; its touch controller stops scanning without the video stream, so taps do nothing in deep. That is why "off" keeps the stream running.
+- A simulated `/tap` exercises the wake path but cannot show whether the glass lights up; ask for a person's eyes after any panel power change.
+- Standby from `/power?standby=N` drops its own HTTP reply (Wi-Fi stops); read the result from `/log` (`power: standby: ... mean N mA`).
+- Powering the C6 off in standby would save 16 mA more but needs a restart to bring esp_hosted back (about 10 s to usable), so it is not done.
+
+**Verified by the user on the device:** a tap wakes the "off" state; picking it up wakes the deep state, with the correct picture back in 76 ms. Both were session 5 open items. **Still to see in normal use:** a real standby cycle (20 minutes untouched with nothing playing), then picking it up.
+
+**Hazards found:**
+- A DSI read (`esp_lcd_panel_io_rx_param`) that the panel cannot answer spins forever in `mipi_dsi_hal` (all DSI timeouts are disabled). A debug read did this, hung the HTTP server, and the device then sat dark and unreachable for hours. `/power?pmode=1` now refuses while the display sleeps, and `CONFIG_ESP_TASK_WDT_PANIC` restarts the device if a task starves the idle tasks for 5 s (verified: reset reason 6, back in ~10 s).
+- After that hang the chip reset into ROM download mode ("waiting for download", `boot:0x204`) on esptool's RTS hard reset. `esptool --after watchdog_reset read_mac` started the app.
+- `CHG_STAT` reads high on battery alone (high while the pack discharged 136 mA), so "charging" now comes from the current's direction.
+- The expanders' unused outputs (speaker amp, external 5 V, USB-A 5 V, camera) are high-impedance with pull-downs: off.
+
 ## Session 8: Favorites scrolling
 
 Favorites scrolling went from **~20 fps** (41 ms frames, 10.5 ms between frames) to **~32 fps** (26.9 ms frames, 3.1 ms between). Switching to the Favorites view went from 47 to 33 ms. Other views are unchanged (Playing 40, Queue 25, Settings 35, Rooms 33-37 ms).

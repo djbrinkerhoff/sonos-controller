@@ -5,11 +5,16 @@
 #include "esp_io_expander.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_sleep.h"
+#include "esp_timer.h"
+#include "driver/gpio.h"
+#include "freertos/semphr.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+
 
 namespace {
 const char* TAG="power";
@@ -85,13 +90,71 @@ Battery battery_read() {
     // Shunt LSB is 2.5 uV across 5 mOhm = 0.5 mA/LSB; M5Unified reports the
     // charge current as the negated shunt current.
     battery.current_ma=-static_cast<int16_t>(shunt_raw)/2;
-    if(auto io=expander.load()) {
-        uint32_t level=0;
-        if(esp_io_expander_get_level(io,PIN_CHG_STAT,&level)==ESP_OK) battery.charging=(level&PIN_CHG_STAT)!=0;
-    }
+    // CHG_STAT reads high on battery alone as well (measured: high while the
+    // pack discharged 136 mA), so the current's direction decides.
+    battery.charging=battery.current_ma>20;
     return battery;
 }
+int power_measure_ma(int seconds, int* low, int* high) {
+    // Shunt only, 128 x 1.1 ms: back-to-back conversions cover the whole
+    // window, so short radio bursts are counted in the average.
+    if(ina_write(REG_CONFIG,0x4925)!=ESP_OK) return 0;
+    vTaskDelay(pdMS_TO_TICKS(300));
+    long long total=0; int count=0, lo=INT32_MAX, hi=INT32_MIN;
+    const TickType_t end=xTaskGetTickCount()+pdMS_TO_TICKS(seconds*1000);
+    while(xTaskGetTickCount()<end) {
+        vTaskDelay(pdMS_TO_TICKS(142));
+        uint16_t raw;
+        if(ina_read(REG_SHUNT,&raw)!=ESP_OK) continue;
+        const int ma=static_cast<int16_t>(raw)/2;  // discharge is positive here
+        total+=ma; ++count; lo=std::min(lo,ma); hi=std::max(hi,ma);
+    }
+    ina_write(REG_CONFIG,INA226_CONFIG);
+    if(low) *low=lo;
+    if(high) *high=hi;
+    return count?static_cast<int>(total/count):0;
+}
 namespace {
+std::atomic<bool> motion_paused{false};
+std::atomic<bool> standby_requested{false};
+std::atomic<int> standby_limit_ms{0};
+const char* standby_result="";
+SemaphoreHandle_t standby_done=nullptr;
+
+// Light-sleeps in 200 ms steps, checking the IMU after each, until the device
+// moves or the touch controller signals. Wi-Fi must already be stopped: the
+// C6 cannot reach a sleeping host. Measured 54 mA at the pack, against 80 mA
+// awake at 40 MHz with the radio in modem sleep.
+const char* run_standby(bmi270_handle_t* imu) {
+    float bx=0,by=0,bz=0;
+    if(bmi270_get_acce_data(imu,&bx,&by,&bz)!=ESP_OK) return "imu unavailable";
+    // ST712x INT idles high; wake on it only if it is not already asserted.
+    const bool touch_wake=gpio_get_level(BSP_LCD_TOUCH_INT)==1;
+    if(touch_wake) { gpio_wakeup_enable(BSP_LCD_TOUCH_INT,GPIO_INTR_LOW_LEVEL); esp_sleep_enable_gpio_wakeup(); }
+    esp_sleep_enable_timer_wakeup(200000);
+    ina_write(REG_CONFIG,0x4925);  // shunt only, back-to-back 141 ms averages
+    const int64_t start=esp_timer_get_time();
+    long long total=0; int samples=0;
+    const char* reason="time limit";
+    for(;;) {
+        esp_light_sleep_start();
+        if(esp_sleep_get_wakeup_cause()==ESP_SLEEP_WAKEUP_GPIO) { reason="touch"; break; }
+        if(uint16_t raw; ina_read(REG_SHUNT,&raw)==ESP_OK) { total+=static_cast<int16_t>(raw)/2; ++samples; }
+        float ax,ay,az,gx,gy,gz;
+        if(bmi270_get_acce_data(imu,&ax,&ay,&az)==ESP_OK && bmi270_get_gyro_data(imu,&gx,&gy,&gz)==ESP_OK) {
+            const float dx=ax-bx,dy=ay-by,dz=az-bz;
+            if(sqrtf(gx*gx+gy*gy+gz*gz)>CONFIG_TAB5_MOTION_DPS || sqrtf(dx*dx+dy*dy+dz*dz)*1000.f>CONFIG_TAB5_MOTION_MILLI_G) { reason="motion"; break; }
+            bx+=dx*0.2f; by+=dy*0.2f; bz+=dz*0.2f;  // same ~0.8 s time constant at 5 Hz
+        }
+        if(const int limit=standby_limit_ms; limit && esp_timer_get_time()-start>=limit*1000LL) break;
+    }
+    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TIMER);
+    if(touch_wake) { esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_GPIO); gpio_wakeup_disable(BSP_LCD_TOUCH_INT); }
+    ina_write(REG_CONFIG,INA226_CONFIG);
+    ESP_LOGI(TAG,"standby: %lld s, woken by %s, mean %d mA",(esp_timer_get_time()-start)/1000000,reason,
+             samples?static_cast<int>(total/samples):0);
+    return reason;
+}
 std::atomic<bool> motion_running{false};
 std::atomic<void(*)()> motion_callback{nullptr};
 void motion_task(void*) {
@@ -123,6 +186,15 @@ void motion_task(void*) {
 #endif
     for(;;) {
         vTaskDelayUntil(&wake,pdMS_TO_TICKS(40));
+        if(standby_requested) {
+            standby_result=run_standby(imu);
+            standby_requested=false;
+            xSemaphoreGive(standby_done);
+            seeded=false; wake=xTaskGetTickCount();
+            if(auto callback=motion_callback.load()) callback();  // wake the screen
+            continue;
+        }
+        if(motion_paused) { seeded=false; continue; }
         float ax,ay,az,gx,gy,gz;
         if(bmi270_get_acce_data(imu,&ax,&ay,&az)!=ESP_OK || bmi270_get_gyro_data(imu,&gx,&gy,&gz)!=ESP_OK) {
             if(++failures==25) ESP_LOGW(TAG,"IMU reads failing on the I2C bus");
@@ -155,6 +227,7 @@ void motion_task(void*) {
 }
 void motion_start(void (*on_motion)()) {
     motion_callback=on_motion;
+    if(!standby_done) standby_done=xSemaphoreCreateBinary();
     bool expected=false;
     if(!motion_running.compare_exchange_strong(expected,true)) return;
     if(xTaskCreate(motion_task,"motion",4096,nullptr,2,nullptr)!=pdPASS) {
@@ -163,3 +236,12 @@ void motion_start(void (*on_motion)()) {
     }
 }
 bool motion_active() { return motion_running.load(); }
+void motion_pause(bool paused) { motion_paused=paused; }
+const char* power_standby(int limit_ms) {
+    if(!motion_running || !standby_done) return "unavailable";
+    standby_limit_ms=limit_ms;
+    standby_requested=true;
+    // The motion task gives up after a failed IMU start; do not wait forever.
+    if(xSemaphoreTake(standby_done,portMAX_DELAY)!=pdTRUE) return "failed";
+    return standby_result;
+}

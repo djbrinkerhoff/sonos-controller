@@ -14,6 +14,13 @@
 #include <cstring>
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
+#include "esp_wifi.h"
+#include "esp_lcd_panel_io.h"
+#include "power.hpp"
+#include "network.hpp"
+#include "display_power.hpp"
+#include "screen.hpp"
+#include "driver/i2c_master.h"
 #include <vector>
 #include <string>
 
@@ -261,6 +268,70 @@ esp_err_t membench(httpd_req_t* request) {
 }
 
 // Switches the visible view so every screen can be captured remotely.
+// Both PI4IOE5V6408 expanders: direction, output, high-Z, pull enable/select, input.
+std::string expander_dump() {
+    std::string text;
+    for(uint8_t address:{0x43,0x44}) {
+        i2c_device_config_t config={}; config.dev_addr_length=I2C_ADDR_BIT_LEN_7; config.device_address=address; config.scl_speed_hz=400000;
+        i2c_master_dev_handle_t dev=nullptr;
+        if(i2c_master_bus_add_device(bsp_i2c_get_handle(),&config,&dev)!=ESP_OK) continue;
+        char line[128]; int n=snprintf(line,sizeof line,"0x%02x",address);
+        for(uint8_t reg:{0x03,0x05,0x07,0x0B,0x0D,0x0F}) {
+            uint8_t value=0;
+            if(i2c_master_transmit_receive(dev,&reg,1,&value,1,100)==ESP_OK) n+=snprintf(line+n,sizeof line-n," r%02X=%02X",reg,value);
+        }
+        i2c_master_bus_rm_device(dev);
+        text+=line; text+="\n";
+    }
+    return text;
+}
+// GET /power?s=10[&bl=0..100][&wifi=none|min|max][&imu=0|1][&exp=1]
+//   [&pmode=1][&off=1|2][&standby=N] applies the settings, waits 2 s, then reports the
+// mean pack current (discharge positive; on USB power it reads ~0).
+esp_err_t power(httpd_req_t* request) {
+    char query[160]{}, v[12]{};
+    httpd_req_get_url_query_str(request,query,sizeof query);
+    auto has=[&](const char* key){ v[0]=0; return httpd_query_key_value(query,key,v,sizeof v)==ESP_OK; };
+    std::string applied;
+    auto note=[&](const char* what,esp_err_t e){ applied+=what; applied+=e==ESP_OK?" ok\n":std::string(" ")+esp_err_to_name(e)+"\n"; };
+    if(has("bl")) note("backlight",bsp_display_brightness_set(atoi(v)));
+    if(has("wifi")) note("wifi ps",esp_wifi_set_ps(!strcmp(v,"max")?WIFI_PS_MAX_MODEM:!strcmp(v,"min")?WIFI_PS_MIN_MODEM:WIFI_PS_NONE));
+    if(has("imu")) { motion_pause(!atoi(v)); applied+="imu ok\n"; }
+    if(has("exp")) applied+=expander_dump();
+    if(has("off")) { bsp_display_lock(0); screen_force_off(atoi(v)==2); bsp_display_unlock(); applied+="screen off\n"; }
+    if(has("pmode")) {
+        // DCS get_power_mode: 0x9C = booster on, sleep out, normal mode, display on.
+        uint8_t mode=0; char line[48];
+        // Never while asleep: a DSI read in ULPS spins forever in the HAL.
+        auto io=fast_flush_panel_io();
+        bsp_display_lock(0);
+        esp_err_t e=io && !display_asleep()?esp_lcd_panel_io_rx_param(io,0x0A,&mode,1):ESP_ERR_INVALID_STATE;
+        bsp_display_unlock();
+        snprintf(line,sizeof line,"panel power mode 0x%02X (%s)\n",mode,esp_err_to_name(e));
+        applied+=line;
+    }
+    const int seconds=has("s")?std::clamp(atoi(v),1,60):10;
+    // standby=N enters standby for at most N seconds; the reply comes after
+    // the device has rejoined the network.
+    if(has("standby") && !display_asleep()) applied+="standby needs the screen off\n";
+    else if(has("standby")) {
+        const int limit=std::clamp(atoi(v),5,600)*1000;
+        network_suspend();
+        applied+=std::string("standby woken by ")+power_standby(limit)+"\n";
+        network_resume();
+        for(int i=0;i<100 && !network_online();++i) vTaskDelay(pdMS_TO_TICKS(100));
+        applied+=network_online()?"rejoined\n":"not rejoined after 10 s\n";
+    }
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    int low=0, high=0;
+    const int mean=power_measure_ma(seconds,&low,&high);
+    char line[96];
+    snprintf(line,sizeof line,"mean %d mA  min %d  max %d  over %d s\n",mean,low,high,seconds);
+    applied+=line;
+    ESP_LOGI(TAG,"power: %s",line);
+    httpd_resp_set_type(request,"text/plain");
+    return httpd_resp_send(request,applied.data(),applied.size());
+}
 esp_err_t show(httpd_req_t* request) {
     char query[32]{}, value[8]{};
     if(httpd_req_get_url_query_str(request,query,sizeof query)!=ESP_OK || httpd_query_key_value(query,"view",value,sizeof value)!=ESP_OK)
@@ -282,6 +353,8 @@ void debug_register(httpd_handle_t server) {
     static const httpd_uri_t drag_uri{.uri="/drag",.method=HTTP_GET,.handler=drag,.user_ctx=nullptr};
     static const httpd_uri_t panel_uri{.uri="/panel",.method=HTTP_GET,.handler=panel,.user_ctx=nullptr};
     httpd_register_uri_handler(server,&panel_uri);
+    static const httpd_uri_t power_uri{.uri="/power",.method=HTTP_GET,.handler=power,.user_ctx=nullptr};
+    httpd_register_uri_handler(server,&power_uri);
     httpd_register_uri_handler(server,&drag_uri);
     static const httpd_uri_t membench_uri{.uri="/membench",.method=HTTP_GET,.handler=membench,.user_ctx=nullptr};
     httpd_register_uri_handler(server,&membench_uri);

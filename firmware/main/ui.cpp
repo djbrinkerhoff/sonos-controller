@@ -1,4 +1,5 @@
 #include "ui.hpp"
+#include "screen.hpp"
 #include "network.hpp"
 #include "bsp/esp-bsp.h"
 #include "esp_app_desc.h"
@@ -258,7 +259,7 @@ void render_progress() {
     lv_label_set_text(np_elapsed,clock_text(position).c_str());
     lv_label_set_text(np_remaining,("-"+clock_text(current.duration-position)).c_str());
 }
-void progress_tick(lv_timer_t*) { if(view==View::NowPlaying) render_progress(); }
+void progress_tick(lv_timer_t*) { if(view==View::NowPlaying && !screen_off()) render_progress(); }
 void render_now_playing() {
     const bool playing_something=have_state && !current.title.empty();
     lv_label_set_text(np_title,playing_something?current.title.c_str():"Nothing playing");

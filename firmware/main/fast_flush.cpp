@@ -32,6 +32,7 @@ void wait_for_band(lv_display_t* display) {
     lv_display_flush_ready(display);
 }
 void flush(lv_display_t* display,const lv_area_t* area,uint8_t* pixels) {
+    if(!framebuffer) { xSemaphoreGive(band_done); return; }  // suspended: nothing to show
     const int w=lv_area_get_width(area), h=lv_area_get_height(area);
     // Same mapping as esp_lvgl_port's PPA path for LV_DISPLAY_ROTATION_90.
     ppa_srm_oper_config_t op={};
@@ -48,14 +49,26 @@ void flush(lv_display_t* display,const lv_area_t* area,uint8_t* pixels) {
 }
 // The first fields of esp_lvgl_port 2.6's private per-display context. The
 // result is verified below by asking the panel for its framebuffer.
-struct PortContextPrefix { int type; void* io; esp_lcd_panel_handle_t panel; };
+struct PortContextPrefix { int type; esp_lcd_panel_io_handle_t io; esp_lcd_panel_handle_t panel; };
+PortContextPrefix* context=nullptr;
+}
+static bool installed=false;
+esp_lcd_panel_handle_t fast_flush_panel() { return installed?context->panel:nullptr; }
+esp_lcd_panel_io_handle_t fast_flush_panel_io() { return installed?context->io:nullptr; }
+void fast_flush_suspend() { framebuffer=nullptr; }
+bool fast_flush_resume(esp_lcd_panel_handle_t panel) {
+    void* fb=nullptr;
+    if(!installed || esp_lcd_dpi_panel_get_frame_buffer(panel,1,&fb)!=ESP_OK || !fb) return false;
+    context->panel=panel;  // keep the port's copy valid for anything that uses it
+    framebuffer=static_cast<uint16_t*>(fb);
+    return true;
 }
 
 const uint16_t* fast_flush_framebuffer() { return framebuffer; }
 uint32_t fast_flush_lost_completions() { return lost_completions; }
 bool fast_flush_install(lv_display_t* display) {
     if(lv_display_get_rotation(display)!=LV_DISPLAY_ROTATION_90) return false;
-    auto* context=static_cast<PortContextPrefix*>(lv_display_get_driver_data(display));
+    context=static_cast<PortContextPrefix*>(lv_display_get_driver_data(display));
     void* fb=nullptr;
     if(!context || !context->panel || esp_lcd_dpi_panel_get_frame_buffer(context->panel,1,&fb)!=ESP_OK || !fb) {
         framebuffer=nullptr;
@@ -71,6 +84,7 @@ bool fast_flush_install(lv_display_t* display) {
         return false;
     }
     framebuffer=static_cast<uint16_t*>(fb);
+    installed=true;
     lv_display_set_flush_cb(display,flush);
     lv_display_set_flush_wait_cb(display,wait_for_band);
     ESP_LOGI(TAG,"PPA rotates directly into the framebuffer");

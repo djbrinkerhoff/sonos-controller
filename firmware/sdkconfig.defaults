@@ -61,3 +61,9 @@ CONFIG_SECURE_SIGNED_APPS_RSA_SCHEME=y
 CONFIG_SECURE_SIGNED_ON_UPDATE_NO_SECURE_BOOT=y
 CONFIG_SECURE_BOOT_BUILD_SIGNED_BINARIES=y
 CONFIG_SECURE_BOOT_SIGNING_KEY="keys/ota_signing_key.pem"
+
+# Power management: lets the firmware lower the CPU clock while the screen is off.
+CONFIG_PM_ENABLE=y
+# A task that starves the idle tasks for 5 s restarts the device instead of
+# leaving it frozen (measured case: a DSI read that never returns).
+CONFIG_ESP_TASK_WDT_PANIC=y

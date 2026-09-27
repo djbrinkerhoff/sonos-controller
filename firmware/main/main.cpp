@@ -6,6 +6,9 @@
 #include "app.hpp"
 #include "ui.hpp"
 #include "fast_flush.hpp"
+#include "display_power.hpp"
+#include "esp_pm.h"
+#include "esp_system.h"
 #include "events.hpp"
 #include "ota.hpp"
 #include "debug.hpp"
@@ -174,7 +177,17 @@ void worker(void*) {
     std::vector<EventTarget> subscribed; TickType_t subscribed_at=0;
     size_t next_thumbnail=0;
     std::vector<size_t> thumbnail_retries;  // one more try for transient download failures
-    bool was_online=false;
+    bool was_online=false, radio_saving=false;
+    // Standby follows CONFIG_TAB5_STANDBY_MINUTES with the screen off and the
+    // selected room not playing. Unknown counts as playing.
+    bool playing=true; TickType_t quiet_since=0, last_playing_check=0;
+    auto check_playing=[&]{
+        last_playing_check=xTaskGetTickCount();
+        const auto target=ui_selected();
+        if(target.id.empty()) { playing=false; return; }
+        const auto summary=client.summary(client.coordinator(target));
+        playing=summary.playback=="PLAYING" || summary.playback=="TRANSITIONING";
+    };
     for(;;) {
         // Sonos answers a new subscription with a full-state event, so an event
         // since subscribing proves events work and polling can relax.
@@ -188,6 +201,24 @@ void worker(void*) {
         std::unique_ptr<Command> c(raw);
         try {
             if(network_online()!=was_online) { was_online=!was_online; ui_online(was_online); }
+            if(screen_off()!=radio_saving) { radio_saving=!radio_saving; network_power_save(radio_saving); }
+            if(!screen_off() || playing) quiet_since=0;
+            else if(!quiet_since) quiet_since=xTaskGetTickCount();
+            if(!c && quiet_since && CONFIG_TAB5_STANDBY_MINUTES>0 && display_asleep() &&
+               xTaskGetTickCount()-quiet_since>=pdMS_TO_TICKS(CONFIG_TAB5_STANDBY_MINUTES*60000)) {
+                ESP_LOGI(TAG,"Nothing playing for %d minutes; standby",CONFIG_TAB5_STANDBY_MINUTES);
+                network_suspend();
+                const char* woken=power_standby();
+                network_resume();
+                ESP_LOGI(TAG,"Standby ended (%s); reconnecting",woken);
+                // Taps queue meanwhile; polling before the network is back would only fail.
+                for(int i=0;i<150 && !network_online();++i) vTaskDelay(pdMS_TO_TICKS(100));
+                quiet_since=0; playing=true;
+                subscribed.clear();       // subscriptions lapsed while offline
+                client.invalidate_topology();
+                next_poll=0;
+                continue;
+            }
             // A boot-time connect can fail while the router is down; the Wi-Fi
             // layer keeps retrying, so load the catalog once it comes back.
             if(!c && initialized && !catalog_loaded && network_online() &&
@@ -250,11 +281,17 @@ void worker(void*) {
                 continue;
             }
             next_poll=xTaskGetTickCount()+pdMS_TO_TICKS(events_live?15000:4000);
-            if(screen_off() && (!c || c->action=="Event")) continue; // nobody is looking; save the speakers the traffic
+            if(screen_off() && (!c || c->action=="Event")) {
+                // Nobody is looking: skip the refresh, but note whether the
+                // room still plays (events, or every 5 minutes) for standby.
+                if(c || xTaskGetTickCount()-last_playing_check>pdMS_TO_TICKS(300000)) check_playing();
+                continue;
+            }
             const auto target=ui_selected();
             if(target.id.empty()) continue;
             const auto state=client.state(target);
             ui_state(target,state);
+            playing=state.playback=="PLAYING" || state.playback=="TRANSITIONING";
             const auto leader=client.coordinator(target);
             std::vector<EventTarget> targets{{leader.ip,"AVTransport"},{target.ip,"RenderingControl"},
                                              {leader.ip,"GroupRenderingControl"},{leader.ip,"ZoneGroupTopology"}};
@@ -437,6 +474,7 @@ extern "C" void app_main() {
     return;
 #endif
     ota_log_boot();
+    ESP_LOGI(TAG,"Reset reason %d",static_cast<int>(esp_reset_reason()));
     await_touch_controller();
     // Measured: a full-screen PSRAM draw buffer (one band) renders Favorites in
     // ~154 ms versus ~69 ms for the BSP's 50-line bands in internal RAM, so the
@@ -449,8 +487,13 @@ extern "C" void app_main() {
     bsp_display_lock(0);
     lv_display_set_rotation(display,LV_DISPLAY_ROTATION_90);
     fast_flush_install(display);
+    display_power_init(display);
     ui_build();
     screen_init(screen_woke);
     bsp_display_unlock();
+    // Full speed while the panel driver holds its lock (screen on); 40 MHz
+    // once display_sleep() deletes the driver. Measured: 9 mA at the pack.
+    esp_pm_config_t pm={}; pm.max_freq_mhz=CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ; pm.min_freq_mhz=40;
+    if(auto result=esp_pm_configure(&pm); result!=ESP_OK) ESP_LOGW(TAG,"Frequency scaling unavailable: %s",esp_err_to_name(result));
     if(xTaskCreate(worker,"sonos",24576,nullptr,4,nullptr)!=pdPASS) ui_toast("Unable to start the controller task",true);
 }

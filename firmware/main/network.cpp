@@ -79,6 +79,25 @@ void network_init() {
         throw std::runtime_error("Unable to start Wi-Fi reconnect task");
 }
 bool network_online() { return events && (xEventGroupGetBits(events) & ONLINE); }
+void network_suspend() {
+    if(!started) return;
+    reconnect=false;
+    xEventGroupClearBits(events,ONLINE|RETRY);
+    if(auto result=esp_wifi_stop(); result!=ESP_OK) ESP_LOGW(TAG,"Wi-Fi stop: %s",esp_err_to_name(result));
+}
+void network_resume() {
+    if(!started) return;
+    reconnect=true;
+    esp_err_t result=esp_wifi_start();
+    if(result==ESP_OK) result=esp_wifi_connect();
+    // A failed connect is retried by the reconnect task with backoff.
+    if(result!=ESP_OK) { ESP_LOGW(TAG,"Wi-Fi resume: %s",esp_err_to_name(result)); xEventGroupSetBits(events,RETRY); }
+}
+void network_power_save(bool save) {
+    if(!started) return;
+    if(auto result=esp_wifi_set_ps(save?WIFI_PS_MAX_MODEM:WIFI_PS_NONE); result!=ESP_OK)
+        ESP_LOGW(TAG,"Wi-Fi power save unchanged: %s",esp_err_to_name(result));
+}
 void network_connect(const std::string& ssid, const std::string& password) {
     if (ssid.empty() || ssid.size()>32 || password.size()>63) throw std::runtime_error("Check Wi-Fi name and password length");
     reconnect=false;
@@ -90,8 +109,9 @@ void network_connect(const std::string& ssid, const std::string& password) {
     check(esp_wifi_set_config(WIFI_IF_STA,&config),"Wi-Fi configuration");
     reconnect=true;
     check(esp_wifi_start(),"Start Wi-Fi"); started=true;
-    // Power save lets the C6 sleep between beacons and was a suspect in the
-    // intermittent SSDP discovery. Revisit together with battery/sleep work.
+    // Full power while connecting and while the screen is on; the worker
+    // switches to modem sleep when the screen turns off. Power save was a
+    // suspect in the intermittent SSDP discovery, which only runs awake.
     if (auto ps=esp_wifi_set_ps(WIFI_PS_NONE); ps!=ESP_OK) ESP_LOGW(TAG,"Wi-Fi power save unchanged: %s",esp_err_to_name(ps));
     check(esp_wifi_connect(),"Connect Wi-Fi");
     if (!(xEventGroupWaitBits(events,ONLINE,pdFALSE,pdFALSE,pdMS_TO_TICKS(20000)) & ONLINE))
