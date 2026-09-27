@@ -1,6 +1,6 @@
 # Dedicated Sonos controller on M5Stack Tab5
 
-Status: standalone favorites-first architecture selected September 26, 2026. The firmware prototype and read-only compatibility probe are implemented; see README.md for current build verification and outstanding hardware/appliance work. Full-library/helper sections below are retained as future alternatives, not the selected implementation.
+Status: standalone favorites-first architecture selected September 26, 2026, and validated on the purchased hardware. The firmware runs on the Tab5, joins Wi-Fi, discovers a household speaker, and plays an Apple Music favorite with working transport and volume. The central risk in this plan — that Sonos may not play Apple Music content from a preserved favorite URI — is retired. SSDP auto-discovery is still unreliable, so a stored manual IP is currently required, and the Radio favorite, grouping, saved areas, queue, and external-change reflection remain untested. See HANDOFF.md for current state and README.md for build and recovery instructions. Full-library/helper sections below are retained as future alternatives, not the selected implementation.
 
 ## Product and assumptions
 

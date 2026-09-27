@@ -44,7 +44,8 @@ Restoring the vendor defaults fixed it completely. This would have been misdiagn
 - Wi-Fi association and DHCP on the C6: **passed**.
 - SSDP auto-discovery: **intermittent** — found a speaker on one boot, none on the next. Manual-IP path works reliably.
 - SOAP against a real speaker (`ListAvailableServices`, topology, favorites): **passed** with zero errors over a 110 s run at the raised timeout.
-- Audible playback, volume, grouping, saved areas: **still not performed.**
+- Audible playback: **passed.** User confirmed audio plays, pauses, and responds to volume up/down on a real Apple Music favorite. This retires the central architectural risk in `PLAN.md` — Sonos does play Apple Music content from a preserved favorite URI, so the favorites-first scope is viable.
+- Room/group volume, grouping/ungrouping, saved areas, queue viewing, external changes from the official app, and the Sonos Radio favorite ("Set The Table"): **still not performed.**
 
 ## Open items
 
@@ -155,9 +156,9 @@ Build log: `artifacts/firmware-build.log`. Some local incremental builds can run
 ## Exact next steps when the user resumes
 
 1. Read this handoff. Inspect current files before changing anything; agents share this directory.
-2. **Validate audible playback** — the main unproven product milestone. Play one Apple Music favorite and the Radio favorite at a modest existing volume, then transport, room/group volume, groups, saved areas, and external changes from the official app.
-3. **Fix SSDP auto-discovery.** It is intermittent and is the main outstanding protocol bug. The seeded manual IP is a stopgap that goes stale if the router reassigns addresses. Clear the `seed` key from NVS once discovery is reliable.
-4. Fix any board/protocol issues observed during playback before expanding UI/features. Then finish the appliance work listed above.
+2. **Finish the playback validation matrix.** Apple Music favorites are proven; still untested are the Sonos Radio favorite ("Set The Table"), room/group volume, grouping/ungrouping, saved areas, queue viewing, and whether external changes made in the official app are reflected. Test every speaker model actually present, not just the one used so far.
+3. **Fix SSDP auto-discovery.** It is intermittent and is the main outstanding protocol bug. Playback currently depends on a seeded manual IP, so the product does not yet work from a cold boot with no stored address; that address also goes stale if the router reassigns it. Clear the `seed` key from NVS once discovery is reliable.
+4. Fix any board/protocol issues observed before expanding UI/features. Then finish the appliance work listed above.
 
 Commands from project root:
 
@@ -192,9 +193,11 @@ bash tools/idf.sh -B build-rev3 -D SDKCONFIG=sdkconfig.rev3.local -D 'SDKCONFIG_
 
 ## Final checkpoint
 
-Verified results: the legacy-P4 firmware build, 40 passing native assertions, 9 passing Python tests, read-only household metadata access, and — as of session 2 — a verified factory flash backup, a clean single-boot to the LVGL UI on real hardware, ST7121 panel detection, Wi-Fi association with a DHCP lease, and a SOAP exchange with a real speaker completing with zero errors.
+Verified results: the legacy-P4 firmware build, 40 passing native assertions, 9 passing Python tests, read-only household metadata access, and — as of session 2 — a verified factory flash backup, a clean single-boot to the LVGL UI on real hardware, ST7121 panel detection, Wi-Fi association with a DHCP lease, a SOAP exchange with a real speaker at zero errors, and **audible playback of an Apple Music favorite with working transport and volume.**
 
-Still unproven: **audible playback.** No playback, volume, or grouping mutation has ever been sent to the user's speakers. The saved private report contains 17 `allowed_favorites`.
+That last item is the significant one. `PLAN.md` selected the favorites-first standalone architecture on the condition that Apple Music playback could be proven, and warned against assuming any Apple Music item is directly playable by Sonos. It is proven for favorites. The saved private report contains 17 `allowed_favorites`.
+
+Still unproven: the Sonos Radio favorite, grouping, saved areas, queue viewing, reflection of external changes, and every speaker model in the household. Also note all playback so far was driven by a **seeded manual IP**; SSDP discovery remains unreliable, so the product does not yet work from a cold boot with no stored address.
 
 A backup of the device's original flash exists at `artifacts/tab5-original.bin` and should be preserved. To return the Tab5 to factory firmware, write that image back and reset.
 
