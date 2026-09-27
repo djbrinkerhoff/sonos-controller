@@ -1,0 +1,704 @@
+#include "ui.hpp"
+#include "network.hpp"
+#include "bsp/esp-bsp.h"
+#include "esp_app_desc.h"
+#include "esp_log.h"
+#include "esp_netif.h"
+#include "esp_ota_ops.h"
+#include "esp_timer.h"
+#include "misc/cache/instance/lv_image_cache.h"
+#include <algorithm>
+#include <map>
+#include <set>
+
+LV_FONT_DECLARE(font_title_56)
+LV_FONT_DECLARE(font_body_32)
+LV_FONT_DECLARE(font_body_26)
+LV_FONT_DECLARE(font_caption_22)
+LV_FONT_DECLARE(font_icons_52)
+
+namespace {
+// Design tokens. The panel is ~11.6 px/mm and read from arm's length, so the
+// smallest tap target is 88 px (~7.5 mm) and body text is 26 px or larger.
+namespace ink {
+constexpr uint32_t bg=0x0F1216, rail=0x0A0D10, surface=0x1A1F25, raised=0x242B33, pressed=0x323B45;
+constexpr uint32_t text=0xF2F4F6, muted=0xA3ADB8, faint=0x6E7883, accent=0xF5A524, on_accent=0x1C1405, danger=0xFF6B6B;
+}
+constexpr int RAIL=128, HEADER=96, W=1280, H=720, CONTENT_W=W-RAIL, CONTENT_H=H-HEADER, PAD=40, TARGET=88;
+const char* ICON_STAR="\xEF\x80\x85";
+const char* ICON_LINK="\xEF\x83\x81";
+const char* ICON_GROUP="\xEF\x97\xBD";
+const char* ICON_RADIO="\xEF\x94\x99";
+
+struct DisplayLock { DisplayLock(){bsp_display_lock(0);} ~DisplayLock(){bsp_display_unlock();} };
+lv_color_t c(uint32_t hex) { return lv_color_hex(hex); }
+
+// ---- small builders ---------------------------------------------------------
+lv_obj_t* div(lv_obj_t* parent) {
+    auto o=lv_obj_create(parent); lv_obj_remove_style_all(o);
+    lv_obj_remove_flag(o,LV_OBJ_FLAG_CLICKABLE); lv_obj_remove_flag(o,LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(o,LV_OBJ_FLAG_EVENT_BUBBLE);
+    return o;
+}
+lv_obj_t* column(lv_obj_t* parent,int gap) {
+    auto o=div(parent); lv_obj_set_flex_flow(o,LV_FLEX_FLOW_COLUMN); lv_obj_set_style_pad_row(o,gap,0); return o;
+}
+lv_obj_t* row(lv_obj_t* parent,int gap) {
+    auto o=div(parent); lv_obj_set_flex_flow(o,LV_FLEX_FLOW_ROW); lv_obj_set_style_pad_column(o,gap,0);
+    lv_obj_set_flex_align(o,LV_FLEX_ALIGN_START,LV_FLEX_ALIGN_CENTER,LV_FLEX_ALIGN_CENTER); return o;
+}
+lv_obj_t* text(lv_obj_t* parent,const lv_font_t* font,uint32_t color,const char* s="") {
+    auto l=lv_label_create(parent); lv_label_set_text(l,s);
+    lv_obj_set_style_text_font(l,font,0); lv_obj_set_style_text_color(l,c(color),0);
+    lv_obj_add_flag(l,LV_OBJ_FLAG_EVENT_BUBBLE);
+    return l;
+}
+// Truncates with an ellipsis; LVGL only truncates when the height is fixed, otherwise it wraps.
+lv_obj_t* one_line(lv_obj_t* l,int width) {
+    lv_obj_set_size(l,width,lv_font_get_line_height(lv_obj_get_style_text_font(l,LV_PART_MAIN)));
+    lv_label_set_long_mode(l,LV_LABEL_LONG_DOT); return l;
+}
+// A plain tappable surface: filled, rounded, darker/lighter when pressed.
+lv_obj_t* tappable(lv_obj_t* parent,int w,int h,uint32_t bg,uint32_t pressed,int radius,lv_event_cb_t cb,void* data=nullptr) {
+    auto b=lv_button_create(parent); lv_obj_remove_style_all(b);
+    lv_obj_set_size(b,w,h);
+    lv_obj_set_style_bg_opa(b,LV_OPA_COVER,0);
+    lv_obj_set_style_bg_color(b,c(bg),0); lv_obj_set_style_bg_color(b,c(pressed),LV_STATE_PRESSED);
+    lv_obj_set_style_radius(b,radius,0);
+    lv_obj_set_style_opa(b,LV_OPA_40,LV_STATE_DISABLED);
+    lv_obj_remove_flag(b,LV_OBJ_FLAG_SCROLL_ON_FOCUS);
+    if(cb) lv_obj_add_event_cb(b,cb,LV_EVENT_CLICKED,data);
+    return b;
+}
+lv_obj_t* icon_button(lv_obj_t* parent,const char* icon,int size,bool primary,lv_event_cb_t cb,void* data=nullptr) {
+    auto b=tappable(parent,size,size,primary?ink::accent:ink::raised,primary?0xFFC45C:ink::pressed,LV_RADIUS_CIRCLE,cb,data);
+    auto l=text(b,size>=112?&font_icons_52:&font_body_32,primary?ink::on_accent:ink::text,icon); lv_obj_center(l);
+    return b;
+}
+lv_obj_t* pill_button(lv_obj_t* parent,const char* label,bool primary,lv_event_cb_t cb,void* data=nullptr) {
+    auto b=tappable(parent,LV_SIZE_CONTENT,TARGET,primary?ink::accent:ink::raised,primary?0xFFC45C:ink::pressed,TARGET/2,cb,data);
+    lv_obj_set_style_pad_hor(b,36,0);
+    auto l=text(b,&font_body_26,primary?ink::on_accent:ink::text,label); lv_obj_center(l);
+    return b;
+}
+void set_icon(lv_obj_t* button,const char* icon) { lv_label_set_text(lv_obj_get_child(button,0),icon); }
+// Wraps decoded pixels for an image widget. The descriptor must outlive the widget's use of it.
+void show_image(lv_obj_t* image,lv_image_dsc_t& dsc,const Artwork& art) {
+    lv_image_set_src(image,nullptr);
+    lv_image_cache_drop(&dsc);
+    if(!art.pixels) return;
+    dsc=lv_image_dsc_t{};
+    dsc.header.magic=LV_IMAGE_HEADER_MAGIC; dsc.header.cf=LV_COLOR_FORMAT_RGB565;
+    dsc.header.w=art.width; dsc.header.h=art.height; dsc.header.stride=art.stride;
+    dsc.data_size=art.stride*art.height; dsc.data=art.pixels;
+    lv_image_set_src(image,&dsc);
+}
+// An artwork frame: rounded surface with a placeholder icon and an image scaled to fill.
+struct ArtFrame {
+    lv_obj_t *frame=nullptr,*placeholder=nullptr,*image=nullptr;
+    Artwork art; lv_image_dsc_t dsc{}; int side=0;
+    void build(lv_obj_t* parent,int size,int radius,const char* icon) {
+        side=size;
+        frame=div(parent); lv_obj_set_size(frame,size,size);
+        lv_obj_set_style_bg_opa(frame,LV_OPA_COVER,0); lv_obj_set_style_bg_color(frame,c(ink::raised),0);
+        lv_obj_set_style_radius(frame,radius,0); lv_obj_set_style_clip_corner(frame,true,0);
+        placeholder=text(frame,size>=240?&font_icons_52:&font_body_32,ink::faint,icon); lv_obj_center(placeholder);
+        image=lv_image_create(frame); lv_obj_center(image); lv_obj_add_flag(image,LV_OBJ_FLAG_EVENT_BUBBLE);
+        lv_obj_add_flag(image,LV_OBJ_FLAG_HIDDEN);
+    }
+    void set(Artwork next) {
+        lv_image_set_src(image,nullptr);  // detach the old pixels before they are freed
+        lv_image_cache_drop(&dsc);
+        art=std::move(next);
+        if(art.pixels) show_image(image,dsc,art);
+        const bool shown=art.pixels!=nullptr;
+        if(shown) {
+            // Cover the frame (crop, never letterbox); the frame clips the overflow.
+            const uint32_t shortest=std::min(art.width,art.height);
+            lv_image_set_scale(image,shortest==static_cast<uint32_t>(side)?256:side*256/shortest);
+            lv_obj_center(image);
+        }
+        lv_obj_set_flag(image,LV_OBJ_FLAG_HIDDEN,!shown);
+        lv_obj_set_flag(placeholder,LV_OBJ_FLAG_HIDDEN,shown);
+    }
+};
+std::string clock_text(int seconds) {
+    if(seconds<0) return "";
+    char buf[16];
+    if(seconds>=3600) snprintf(buf,sizeof buf,"%d:%02d:%02d",seconds/3600,seconds/60%60,seconds%60);
+    else snprintf(buf,sizeof buf,"%d:%02d",seconds/60,seconds%60);
+    return buf;
+}
+
+// ---- model (touched only with the display lock held) -------------------------
+std::vector<sonos::Room> rooms;
+std::vector<sonos::Favorite> favorites;
+std::vector<Area> areas;
+std::map<std::string,sonos::Summary> summaries;
+sonos::Room selected;
+sonos::State current; bool have_state=false;
+View view=View::NowPlaying;
+bool group_mode=false; std::set<std::string> group_checked;
+Battery battery; bool battery_known=false, online=false;
+// Track position is interpolated between polls so the progress bar moves smoothly.
+int64_t position_at=0;
+
+std::vector<const sonos::Room*> group_of(const sonos::Room& room) {
+    std::vector<const sonos::Room*> members;
+    for(auto& r:rooms) if(!room.coordinator.empty() && r.coordinator==room.coordinator) members.push_back(&r);
+    return members;
+}
+void send(Command* command) { if(!submit(command)) ui_toast("Still working on the last request. Try again.",true); }
+Command* for_room(const char* action) { auto k=new Command; k->action=action; k->room=selected; return k; }
+
+// ---- widgets ------------------------------------------------------------------
+lv_obj_t *rail_items[5], *views[5];
+lv_obj_t *room_chip,*room_chip_name,*room_chip_extra,*battery_label,*offline_label,*toast,*keyboard;
+lv_timer_t* toast_timer;
+// Now Playing
+ArtFrame now_art;
+lv_obj_t *np_title,*np_artist,*np_album,*np_progress,*np_elapsed,*np_remaining,*np_times;
+lv_obj_t *np_prev,*np_play,*np_next,*np_mute,*np_volume,*np_volume_value,*np_volume_caption,*np_empty_hint;
+// Favorites
+lv_obj_t* fav_grid;
+struct Tile { ArtFrame art; };
+std::map<std::string,Tile> tiles;  // node-stable, so the image descriptors stay put
+// Queue, Rooms, Settings
+lv_obj_t *queue_list,*queue_header;
+lv_obj_t *rooms_title,*rooms_actions,*area_row,*room_grid;
+lv_obj_t *ssid_input,*password_input,*seed_input,*device_info;
+lv_obj_t *area_dialog,*area_name_input;
+
+void render_rail() {
+    for(int i=0;i<5;++i) {
+        const bool active=static_cast<int>(view)==i;
+        lv_obj_set_style_bg_opa(rail_items[i],active?LV_OPA_COVER:LV_OPA_TRANSP,0);
+        for(uint32_t k=0;k<lv_obj_get_child_count(rail_items[i]);++k)
+            lv_obj_set_style_text_color(lv_obj_get_child(rail_items[i],k),c(active?ink::accent:ink::muted),0);
+    }
+}
+void render_room_chip() {
+    lv_label_set_text(room_chip_name,selected.name.empty()?"Choose a room":selected.name.c_str());
+    const auto members=group_of(selected);
+    if(members.size()>1) lv_label_set_text_fmt(room_chip_extra,"%s  + %u",ICON_LINK,static_cast<unsigned>(members.size()-1));
+    else lv_label_set_text(room_chip_extra,"");
+}
+void render_device_info();
+void render_rooms();
+void render_now_playing();
+
+void show_view(View next) {
+    // Queue and Rooms load on demand; a busy worker picks them up on its next poll.
+    if(next!=view && (next==View::Queue || next==View::Rooms)) submit(for_room(next==View::Queue?"Queue":"Poll"));
+    view=next;
+    for(int i=0;i<5;++i) lv_obj_set_flag(views[i],LV_OBJ_FLAG_HIDDEN,i!=static_cast<int>(next));
+    lv_obj_add_flag(keyboard,LV_OBJ_FLAG_HIDDEN);
+    render_rail();
+    if(next==View::Settings) render_device_info();
+    if(next==View::Rooms) render_rooms();
+}
+void nav_clicked(lv_event_t* e) {
+    const auto next=static_cast<View>(reinterpret_cast<uintptr_t>(lv_event_get_user_data(e)));
+    show_view(next);
+}
+
+// ---- Now Playing ------------------------------------------------------------------
+void transport_clicked(lv_event_t* e) {
+    if(selected.id.empty()) return;
+    std::string action=static_cast<const char*>(lv_event_get_user_data(e));
+    auto supports=[](const char* a){ return (","+current.actions+",").find(std::string(",")+a+",")!=std::string::npos; };
+    if(action=="Toggle") {
+        if(current.playback=="PLAYING") action=supports("Pause")?"Pause":"Stop";
+        else action="Play";
+    }
+    // Reflect the press immediately; the next poll confirms it.
+    if(action=="Pause"||action=="Stop") { current.playback="PAUSED_PLAYBACK"; set_icon(np_play,LV_SYMBOL_PLAY); }
+    if(action=="Play") { current.playback="PLAYING"; set_icon(np_play,LV_SYMBOL_PAUSE); }
+    send(for_room(action.c_str()));
+}
+bool grouped() { return group_of(selected).size()>1; }
+void mute_clicked(lv_event_t*) {
+    if(selected.id.empty()) return;
+    const bool muted=grouped()?current.group_muted:current.muted;
+    auto k=for_room(grouped()?"GroupMute":"Mute"); k->value=!muted; send(k);
+    if(grouped()) current.group_muted=!muted; else current.muted=!muted;
+    set_icon(np_mute,!muted?LV_SYMBOL_MUTE:LV_SYMBOL_VOLUME_MAX);
+}
+void volume_event(lv_event_t* e) {
+    const int value=lv_slider_get_value(np_volume);
+    lv_label_set_text_fmt(np_volume_value,"%d",value);
+    if(lv_event_get_code(e)==LV_EVENT_RELEASED && !selected.id.empty()) {
+        auto k=for_room(grouped()?"GroupVolume":"Volume"); k->value=value; send(k);
+    }
+}
+void browse_clicked(lv_event_t*) { show_view(View::Favorites); }
+void render_progress() {
+    const bool known=have_state && current.duration>0;
+    lv_obj_set_flag(np_progress,LV_OBJ_FLAG_HIDDEN,!known);
+    lv_obj_set_flag(np_times,LV_OBJ_FLAG_HIDDEN,!known);
+    if(!known) return;
+    int position=current.position;
+    if(current.playback=="PLAYING") position+=static_cast<int>((esp_timer_get_time()-position_at)/1000000);
+    position=std::clamp(position,0,current.duration);
+    lv_bar_set_range(np_progress,0,current.duration);
+    lv_bar_set_value(np_progress,position,LV_ANIM_OFF);
+    lv_label_set_text(np_elapsed,clock_text(position).c_str());
+    lv_label_set_text(np_remaining,("-"+clock_text(current.duration-position)).c_str());
+}
+void progress_tick(lv_timer_t*) { if(view==View::NowPlaying) render_progress(); }
+void render_now_playing() {
+    const bool playing_something=have_state && !current.title.empty();
+    lv_label_set_text(np_title,playing_something?current.title.c_str():"Nothing playing");
+    lv_label_set_text(np_artist,playing_something?current.artist.c_str():"");
+    lv_label_set_text(np_album,playing_something?current.album.c_str():"");
+    lv_obj_set_flag(np_empty_hint,LV_OBJ_FLAG_HIDDEN,playing_something || selected.id.empty());
+    auto supports=[](const char* a){ return (","+current.actions+",").find(std::string(",")+a+",")!=std::string::npos; };
+    set_icon(np_play,current.playback=="PLAYING"?LV_SYMBOL_PAUSE:LV_SYMBOL_PLAY);
+    lv_obj_set_state(np_next,LV_STATE_DISABLED,!supports("Next"));
+    lv_obj_set_state(np_prev,LV_STATE_DISABLED,!supports("Previous"));
+    const bool group=grouped();
+    const int volume=group?current.group_volume:current.volume;
+    const bool muted=group?current.group_muted:current.muted;
+    if(!lv_obj_has_state(np_volume,LV_STATE_PRESSED)) {
+        lv_slider_set_value(np_volume,volume,LV_ANIM_OFF);
+        lv_label_set_text_fmt(np_volume_value,"%d",volume);
+    }
+    set_icon(np_mute,muted?LV_SYMBOL_MUTE:LV_SYMBOL_VOLUME_MAX);
+    if(group) lv_label_set_text_fmt(np_volume_caption,"%s  Group volume · %u rooms",ICON_LINK,static_cast<unsigned>(group_of(selected).size()));
+    lv_obj_set_flag(np_volume_caption,LV_OBJ_FLAG_HIDDEN,!group);
+    render_progress();
+}
+void build_now_playing(lv_obj_t* v) {
+    now_art.build(v,480,24,LV_SYMBOL_AUDIO);
+    lv_obj_align(now_art.frame,LV_ALIGN_LEFT_MID,PAD,0);
+    const int x=PAD+480+56, width=CONTENT_W-x-PAD;
+    auto info=column(v,0); lv_obj_set_size(info,width,480); lv_obj_align(info,LV_ALIGN_LEFT_MID,x,0);
+    lv_obj_set_flex_align(info,LV_FLEX_ALIGN_START,LV_FLEX_ALIGN_START,LV_FLEX_ALIGN_START);
+    np_title=text(info,&font_title_56,ink::text,"Nothing playing");
+    lv_obj_set_width(np_title,width); lv_label_set_long_mode(np_title,LV_LABEL_LONG_DOT);
+    lv_obj_set_style_max_height(np_title,136,0); lv_obj_set_height(np_title,LV_SIZE_CONTENT);
+    np_artist=one_line(text(info,&font_body_32,ink::muted),width); lv_obj_set_style_pad_top(np_artist,8,0);
+    np_album=one_line(text(info,&font_body_26,ink::faint),width); lv_obj_set_style_pad_top(np_album,4,0);
+    np_empty_hint=pill_button(info,"Browse favorites",false,browse_clicked); lv_obj_set_style_margin_top(np_empty_hint,24,0);
+    auto grow=div(info); lv_obj_set_flex_grow(grow,1);
+    np_progress=lv_bar_create(info); lv_obj_set_size(np_progress,width,8);
+    lv_obj_set_style_bg_color(np_progress,c(ink::raised),0); lv_obj_set_style_bg_opa(np_progress,LV_OPA_COVER,0);
+    lv_obj_set_style_bg_color(np_progress,c(ink::text),LV_PART_INDICATOR);
+    np_times=div(info); lv_obj_set_size(np_times,width,36);
+    np_elapsed=text(np_times,&font_caption_22,ink::faint); lv_obj_align(np_elapsed,LV_ALIGN_LEFT_MID,0,0);
+    np_remaining=text(np_times,&font_caption_22,ink::faint); lv_obj_align(np_remaining,LV_ALIGN_RIGHT_MID,0,0);
+    auto transport=row(info,48); lv_obj_set_size(transport,width,136);
+    lv_obj_set_flex_align(transport,LV_FLEX_ALIGN_CENTER,LV_FLEX_ALIGN_CENTER,LV_FLEX_ALIGN_CENTER);
+    np_prev=icon_button(transport,LV_SYMBOL_PREV,104,false,transport_clicked,(void*)"Previous");
+    np_play=icon_button(transport,LV_SYMBOL_PLAY,128,true,transport_clicked,(void*)"Toggle");
+    np_next=icon_button(transport,LV_SYMBOL_NEXT,104,false,transport_clicked,(void*)"Next");
+    auto volume=row(info,24); lv_obj_set_size(volume,width,TARGET); lv_obj_set_style_margin_top(volume,16,0);
+    np_mute=icon_button(volume,LV_SYMBOL_VOLUME_MAX,TARGET,false,mute_clicked);
+    // A thick bar-style slider: the whole 56 px track is the target, no thin knob.
+    np_volume=lv_slider_create(volume); lv_obj_set_size(np_volume,width-TARGET-72-2*24,56);
+    lv_slider_set_range(np_volume,0,100);
+    lv_obj_set_style_bg_color(np_volume,c(ink::raised),0); lv_obj_set_style_bg_opa(np_volume,LV_OPA_COVER,0);
+    lv_obj_set_style_radius(np_volume,28,0); lv_obj_set_style_radius(np_volume,28,LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(np_volume,c(ink::accent),LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(np_volume,LV_OPA_TRANSP,LV_PART_KNOB); lv_obj_set_style_pad_all(np_volume,0,LV_PART_KNOB);
+    lv_obj_set_style_shadow_width(np_volume,0,LV_PART_KNOB);
+    lv_obj_set_ext_click_area(np_volume,16);
+    lv_obj_add_event_cb(np_volume,volume_event,LV_EVENT_VALUE_CHANGED,nullptr);
+    lv_obj_add_event_cb(np_volume,volume_event,LV_EVENT_RELEASED,nullptr);
+    np_volume_value=text(volume,&font_body_32,ink::text,"0"); lv_obj_set_width(np_volume_value,72);
+    lv_obj_set_style_text_align(np_volume_value,LV_TEXT_ALIGN_RIGHT,0);
+    np_volume_caption=text(info,&font_caption_22,ink::faint,"Volume");
+    lv_obj_set_style_pad_left(np_volume_caption,TARGET+24,0);
+    lv_timer_create(progress_tick,1000,nullptr);
+}
+
+// ---- Favorites --------------------------------------------------------------------
+void favorite_clicked(lv_event_t* e) {
+    const auto index=reinterpret_cast<uintptr_t>(lv_event_get_user_data(e));
+    if(index>=favorites.size()) return;
+    if(selected.id.empty()) { ui_toast("Choose a room first",true); show_view(View::Rooms); return; }
+    auto k=for_room("Favorite"); k->favorite=favorites[index];
+    if(!submit(k)) { ui_toast("Still working on the last request. Try again.",true); return; }
+    ui_toast("Starting "+favorites[index].title+" in "+selected.name);
+    show_view(View::NowPlaying);
+}
+void render_favorites() {
+    lv_obj_clean(fav_grid); tiles.clear();
+    if(favorites.empty()) {
+        auto l=text(fav_grid,&font_body_26,ink::muted,"No Apple Music or Sonos Radio favorites yet.\nAdd some in the Sonos app; they appear here automatically.");
+        lv_obj_set_width(l,CONTENT_W-2*PAD);
+        return;
+    }
+    constexpr int columns=5, gap=24, tile=(CONTENT_W-2*PAD-(columns-1)*gap)/columns;
+    for(size_t i=0;i<favorites.size();++i) {
+        const auto& f=favorites[i];
+        auto card=tappable(fav_grid,tile,LV_SIZE_CONTENT,ink::bg,ink::surface,20,favorite_clicked,reinterpret_cast<void*>(i));
+        lv_obj_set_flex_flow(card,LV_FLEX_FLOW_COLUMN); lv_obj_set_style_pad_row(card,8,0); lv_obj_set_style_pad_bottom(card,8,0);
+        auto& t=tiles[f.id+"#"+std::to_string(i)];
+        t.art.build(card,tile,16,f.radio?ICON_RADIO:LV_SYMBOL_AUDIO);
+        // Two lines of title at a fixed height keep every row of tiles aligned.
+        auto title=text(card,&font_body_26,ink::text,f.title.c_str());
+        lv_obj_set_size(title,tile,72); lv_label_set_long_mode(title,LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_line_space(title,2,0);
+        if(f.radio) {  // nearly everything is Apple Music, so only radio is marked
+            auto badge=div(t.art.frame); lv_obj_set_size(badge,52,52); lv_obj_align(badge,LV_ALIGN_TOP_RIGHT,-10,10);
+            lv_obj_set_style_bg_opa(badge,LV_OPA_80,0); lv_obj_set_style_bg_color(badge,c(ink::bg),0);
+            lv_obj_set_style_radius(badge,LV_RADIUS_CIRCLE,0);
+            auto i=text(badge,&font_caption_22,ink::text,ICON_RADIO); lv_obj_center(i);
+        }
+    }
+}
+void build_favorites(lv_obj_t* v) {
+    fav_grid=v;
+    lv_obj_set_flex_flow(v,LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_style_pad_all(v,PAD,0); lv_obj_set_style_pad_top(v,24,0);
+    lv_obj_set_style_pad_column(v,24,0); lv_obj_set_style_pad_row(v,32,0);
+    text(v,&font_body_26,ink::muted,"Connect to Wi-Fi in Settings to find your Sonos system.");
+}
+
+// ---- Queue ----------------------------------------------------------------------------
+void queue_clicked(lv_event_t* e) {
+    if(selected.id.empty()) return;
+    auto k=for_room("QueueTrack"); k->value=static_cast<int>(reinterpret_cast<uintptr_t>(lv_event_get_user_data(e))); send(k);
+}
+void build_queue(lv_obj_t* v) {
+    lv_obj_set_flex_flow(v,LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_all(v,PAD,0); lv_obj_set_style_pad_top(v,24,0); lv_obj_set_style_pad_row(v,8,0);
+    queue_header=text(v,&font_body_32,ink::text,"Up next");
+    lv_obj_set_style_pad_bottom(queue_header,12,0);
+    queue_list=column(v,8); lv_obj_set_width(queue_list,CONTENT_W-2*PAD); lv_obj_set_height(queue_list,LV_SIZE_CONTENT);
+}
+
+// ---- Rooms ------------------------------------------------------------------------------
+void room_clicked(lv_event_t* e) {
+    const auto index=reinterpret_cast<uintptr_t>(lv_event_get_user_data(e));
+    if(index>=rooms.size()) return;
+    const auto& room=rooms[index];
+    if(group_mode) {
+        if(room.id==selected.id) return;
+        if(!group_checked.erase(room.id)) group_checked.insert(room.id);
+        render_rooms();
+        return;
+    }
+    ui_select(room.id);
+    auto k=for_room("Poll"); submit(k);
+    show_view(View::NowPlaying);
+}
+void group_start(lv_event_t*) {
+    if(selected.id.empty()) return;
+    group_mode=true; group_checked.clear();
+    for(auto* r:group_of(selected)) if(r->id!=selected.id) group_checked.insert(r->id);
+    render_rooms();
+}
+void group_cancel(lv_event_t*) { group_mode=false; render_rooms(); }
+void group_apply(lv_event_t*) {
+    auto k=for_room("Group"); k->area_ids.push_back(selected.id);
+    for(auto& id:group_checked) k->area_ids.push_back(id);
+    group_mode=false; render_rooms();
+    if(submit(k)) ui_toast("Regrouping rooms..."); else ui_toast("Still working on the last request. Try again.",true);
+}
+void area_clicked(lv_event_t* e) {
+    const auto index=reinterpret_cast<uintptr_t>(lv_event_get_user_data(e));
+    if(index>=areas.size()) return;
+    auto k=new Command; k->action="Area"; k->area_ids=areas[index].ids; k->name=areas[index].name;
+    if(submit(k)) ui_toast("Grouping "+areas[index].name+"..."); else ui_toast("Still working on the last request. Try again.",true);
+}
+void area_save_open(lv_event_t*) {
+    if(selected.id.empty()) return;
+    lv_textarea_set_text(area_name_input,"");
+    lv_obj_remove_flag(area_dialog,LV_OBJ_FLAG_HIDDEN); lv_obj_move_foreground(area_dialog);
+    lv_keyboard_set_textarea(keyboard,area_name_input);
+    lv_obj_remove_flag(keyboard,LV_OBJ_FLAG_HIDDEN); lv_obj_move_foreground(keyboard);
+}
+void area_save_close(lv_event_t*) { lv_obj_add_flag(area_dialog,LV_OBJ_FLAG_HIDDEN); lv_obj_add_flag(keyboard,LV_OBJ_FLAG_HIDDEN); }
+void area_save_confirm(lv_event_t* e) {
+    auto k=for_room("SaveArea"); k->name=lv_textarea_get_text(area_name_input);
+    area_save_close(e); send(k);
+}
+void render_rooms() {
+    if(!room_grid) return;
+    lv_label_set_text(rooms_title,group_mode?("Choose rooms to play with "+selected.name).c_str():"Tap a room to control it");
+    lv_obj_clean(rooms_actions);
+    if(group_mode) { pill_button(rooms_actions,"Cancel",false,group_cancel); pill_button(rooms_actions,"Done",true,group_apply); }
+    else if(!selected.id.empty()) {
+        auto save=pill_button(rooms_actions,"",false,area_save_open);
+        lv_label_set_text_fmt(lv_obj_get_child(save,0),"%s  Save as area",LV_SYMBOL_PLUS);
+        lv_obj_set_style_bg_opa(save,LV_OPA_TRANSP,0); lv_obj_set_style_border_width(save,2,0); lv_obj_set_style_border_color(save,c(ink::raised),0);
+        auto b=pill_button(rooms_actions,"",false,group_start);
+        lv_label_set_text_fmt(lv_obj_get_child(b,0),"%s  Group rooms",ICON_GROUP);
+    }
+    // Saved areas appear only once there are some.
+    lv_obj_clean(area_row);
+    lv_obj_set_flag(area_row,LV_OBJ_FLAG_HIDDEN,group_mode || areas.empty());
+    for(size_t i=0;i<areas.size();++i) {
+        auto b=pill_button(area_row,"",false,area_clicked,reinterpret_cast<void*>(i));
+        lv_label_set_text_fmt(lv_obj_get_child(b,0),"%s  %s",ICON_GROUP,areas[i].name.c_str());
+    }
+    lv_obj_clean(room_grid);
+    constexpr int columns=3, gap=24, card_w=(CONTENT_W-2*PAD-(columns-1)*gap)/columns;
+    for(size_t i=0;i<rooms.size();++i) {
+        const auto& r=rooms[i];
+        const bool is_selected=r.id==selected.id;
+        const bool checked=group_mode && (is_selected || group_checked.count(r.id));
+        auto card=tappable(room_grid,card_w,168,ink::surface,ink::pressed,20,room_clicked,reinterpret_cast<void*>(i));
+        lv_obj_set_style_pad_all(card,21,0);  // + the 3 px border every card has, so text lines up
+        lv_obj_set_style_border_width(card,3,0);
+        lv_obj_set_style_border_color(card,c(is_selected || checked?ink::accent:ink::surface),0);
+        auto name=one_line(text(card,&font_body_32,ink::text,r.name.c_str()),card_w-48-56);
+        lv_obj_align(name,LV_ALIGN_TOP_LEFT,0,0);
+        auto it=summaries.find(r.coordinator);
+        const bool playing=it!=summaries.end() && it->second.playback=="PLAYING";
+        std::string line=it==summaries.end()?"":it->second.title.empty()?"Nothing playing":it->second.title+(it->second.artist.empty()?"":" · "+it->second.artist);
+        auto detail=one_line(text(card,&font_caption_22,playing?ink::muted:ink::faint,line.c_str()),card_w-48);
+        lv_obj_align(detail,LV_ALIGN_BOTTOM_LEFT,0,0);
+        size_t mates=0; for(auto& o:rooms) if(o.coordinator==r.coordinator && o.id!=r.id) ++mates;
+        if(mates) {
+            auto g=text(card,&font_caption_22,ink::muted,""); lv_label_set_text_fmt(g,"%s  with %u more",ICON_LINK,static_cast<unsigned>(mates));
+            lv_obj_align(g,LV_ALIGN_LEFT_MID,0,6);
+        }
+        const char* badge=group_mode?(checked?LV_SYMBOL_OK:""):(playing?LV_SYMBOL_VOLUME_MAX:"");
+        auto b=text(card,&font_body_32,checked||playing?ink::accent:ink::faint,badge); lv_obj_align(b,LV_ALIGN_TOP_RIGHT,0,0);
+    }
+}
+void build_rooms(lv_obj_t* v) {
+    lv_obj_set_flex_flow(v,LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_all(v,PAD,0); lv_obj_set_style_pad_top(v,24,0); lv_obj_set_style_pad_row(v,24,0);
+    auto top=div(v); lv_obj_set_size(top,CONTENT_W-2*PAD,TARGET);
+    rooms_title=text(top,&font_body_26,ink::muted,"Tap a room to control it"); lv_obj_align(rooms_title,LV_ALIGN_LEFT_MID,0,0);
+    rooms_actions=row(top,16); lv_obj_set_size(rooms_actions,LV_SIZE_CONTENT,TARGET); lv_obj_align(rooms_actions,LV_ALIGN_RIGHT_MID,0,0);
+    area_row=row(v,16); lv_obj_set_width(area_row,CONTENT_W-2*PAD); lv_obj_set_height(area_row,LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(area_row,LV_FLEX_FLOW_ROW_WRAP); lv_obj_set_style_pad_row(area_row,16,0);
+    room_grid=row(v,24); lv_obj_set_width(room_grid,CONTENT_W-2*PAD); lv_obj_set_height(room_grid,LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(room_grid,LV_FLEX_FLOW_ROW_WRAP); lv_obj_set_style_pad_row(room_grid,24,0);
+    // Naming an area: a small dialog above the keyboard.
+    area_dialog=div(lv_layer_top()); lv_obj_set_size(area_dialog,W,H-320);
+    lv_obj_add_flag(area_dialog,LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_style_bg_opa(area_dialog,LV_OPA_80,0); lv_obj_set_style_bg_color(area_dialog,c(0x000000),0);
+    auto card=column(area_dialog,20); lv_obj_set_size(card,720,LV_SIZE_CONTENT); lv_obj_align(card,LV_ALIGN_CENTER,0,0);
+    lv_obj_set_style_bg_opa(card,LV_OPA_COVER,0); lv_obj_set_style_bg_color(card,c(ink::surface),0);
+    lv_obj_set_style_radius(card,24,0); lv_obj_set_style_pad_all(card,32,0);
+    text(card,&font_body_32,ink::text,"Name this group");
+    area_name_input=lv_textarea_create(card); lv_textarea_set_one_line(area_name_input,true);
+    lv_textarea_set_placeholder_text(area_name_input,"e.g. Downstairs"); lv_textarea_set_max_length(area_name_input,32);
+    lv_obj_set_width(area_name_input,656); lv_obj_set_style_text_font(area_name_input,&font_body_32,0);
+    auto buttons=row(card,16); lv_obj_set_size(buttons,656,TARGET);
+    lv_obj_set_flex_align(buttons,LV_FLEX_ALIGN_END,LV_FLEX_ALIGN_CENTER,LV_FLEX_ALIGN_CENTER);
+    pill_button(buttons,"Cancel",false,area_save_close);
+    pill_button(buttons,"Save area",true,area_save_confirm);
+    lv_obj_add_flag(area_dialog,LV_OBJ_FLAG_HIDDEN);
+}
+
+// ---- Settings -----------------------------------------------------------------------
+void input_focused(lv_event_t* e) {
+    auto target=lv_event_get_target_obj(e);
+    lv_keyboard_set_textarea(keyboard,target);
+    lv_obj_remove_flag(keyboard,LV_OBJ_FLAG_HIDDEN); lv_obj_move_foreground(keyboard);
+}
+lv_obj_t* labeled_input(lv_obj_t* parent,const char* label,const char* placeholder,int width,bool password=false) {
+    text(parent,&font_caption_22,ink::muted,label);
+    auto t=lv_textarea_create(parent); lv_textarea_set_one_line(t,true); lv_textarea_set_password_mode(t,password);
+    lv_textarea_set_placeholder_text(t,placeholder); lv_obj_set_width(t,width);
+    lv_obj_set_style_text_font(t,&font_body_32,0); lv_obj_set_style_pad_ver(t,20,0);
+    lv_obj_add_event_cb(t,input_focused,LV_EVENT_FOCUSED,nullptr);
+    return t;
+}
+void connect_clicked(lv_event_t*) {
+    auto k=new Command; k->action="Connect";
+    k->ssid=lv_textarea_get_text(ssid_input); k->password=lv_textarea_get_text(password_input); k->seed=lv_textarea_get_text(seed_input);
+    lv_obj_add_flag(keyboard,LV_OBJ_FLAG_HIDDEN);
+    if(submit(k)) ui_toast("Connecting to "+k->ssid+"..."); else ui_toast("Still working on the last request. Try again.",true);
+}
+void render_device_info() {
+    std::string info;
+    if(battery_known) {
+        char b[96];
+        if(battery.present) snprintf(b,sizeof b,"Battery  %d%%  (%.2f V%s)\n",battery.percent,battery.pack_mv/1000.0,battery.charging?", charging":"");
+        else snprintf(b,sizeof b,"Battery  not detected\n");
+        info+=b;
+    }
+    esp_netif_ip_info_t ip{}; char address[16]="-";
+    if(auto netif=esp_netif_get_handle_from_ifkey("WIFI_STA_DEF"); netif && esp_netif_get_ip_info(netif,&ip)==ESP_OK && ip.ip.addr)
+        esp_ip4addr_ntoa(&ip.ip,address,sizeof address);
+    info+=std::string("Address  ")+address+"\n";
+    info+=std::string("Firmware  ")+esp_app_get_description()->version+"\n";
+    if(auto running=esp_ota_get_running_partition()) info+=std::string("Slot  ")+running->label+"\n";
+    info+=std::string("Wi-Fi  ")+(online?"connected":"disconnected");
+    lv_label_set_text(device_info,info.c_str());
+}
+void build_settings(lv_obj_t* v) {
+    lv_obj_set_style_pad_all(v,PAD,0); lv_obj_set_style_pad_top(v,24,0);
+    auto form=column(v,12); lv_obj_set_size(form,600,LV_SIZE_CONTENT);
+    text(form,&font_body_32,ink::text,"Wi-Fi");
+    ssid_input=labeled_input(form,"Network name (2.4 GHz)","Network",600); lv_textarea_set_max_length(ssid_input,32);
+    password_input=labeled_input(form,"Password","Password",600,true); lv_textarea_set_max_length(password_input,63);
+    seed_input=labeled_input(form,"Speaker IP address (optional)","Found automatically",600); lv_textarea_set_max_length(seed_input,15);
+    lv_textarea_set_accepted_chars(seed_input,"0123456789.");
+    auto connect=pill_button(form,"Connect & save",true,connect_clicked); lv_obj_set_style_margin_top(connect,16,0);
+    lv_textarea_set_text(ssid_input,setting("ssid").c_str());
+    lv_textarea_set_text(password_input,setting("password").c_str());
+    lv_textarea_set_text(seed_input,setting("seed").c_str());
+    auto about=column(v,16); lv_obj_set_size(about,440,LV_SIZE_CONTENT); lv_obj_align(about,LV_ALIGN_TOP_RIGHT,0,0);
+    text(about,&font_body_32,ink::text,"This controller");
+    device_info=text(about,&font_body_26,ink::muted,""); lv_obj_set_width(device_info,440);
+    lv_obj_set_style_text_line_space(device_info,10,0);
+    auto note=text(about,&font_caption_22,ink::faint,"Plays Apple Music and Sonos Radio favorites from your Sonos app. Everything stays on your home network.");
+    lv_obj_set_width(note,440); lv_obj_set_style_margin_top(note,16,0);
+}
+
+// ---- chrome -------------------------------------------------------------------------------
+void toast_hide(lv_timer_t* t) { lv_obj_add_flag(toast,LV_OBJ_FLAG_HIDDEN); lv_timer_pause(t); }
+void chip_clicked(lv_event_t*) { show_view(View::Rooms); auto k=for_room("Poll"); submit(k); }
+void build_rail(lv_obj_t* screen) {
+    auto rail=div(screen); lv_obj_set_size(rail,RAIL,H);
+    lv_obj_set_style_bg_opa(rail,LV_OPA_COVER,0); lv_obj_set_style_bg_color(rail,c(ink::rail),0);
+    lv_obj_set_flex_flow(rail,LV_FLEX_FLOW_COLUMN); lv_obj_set_style_pad_top(rail,16,0); lv_obj_set_style_pad_row(rail,4,0);
+    struct Item { const char* icon; const char* label; } items[5]={
+        {LV_SYMBOL_AUDIO,"Playing"},{ICON_STAR,"Favorites"},{LV_SYMBOL_LIST,"Queue"},{LV_SYMBOL_HOME,"Rooms"},{LV_SYMBOL_SETTINGS,"Settings"}};
+    for(int i=0;i<5;++i) {
+        if(i==4) { auto grow=div(rail); lv_obj_set_flex_grow(grow,1); }
+        auto b=tappable(rail,RAIL,112,ink::surface,ink::pressed,0,nav_clicked,reinterpret_cast<void*>(static_cast<uintptr_t>(i)));
+        lv_obj_set_style_bg_opa(b,LV_OPA_TRANSP,0);
+        lv_obj_set_flex_flow(b,LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(b,LV_FLEX_ALIGN_CENTER,LV_FLEX_ALIGN_CENTER,LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_row(b,6,0);
+        text(b,&font_body_32,ink::muted,items[i].icon);
+        text(b,&font_caption_22,ink::muted,items[i].label);
+        rail_items[i]=b;
+    }
+}
+void build_header(lv_obj_t* screen) {
+    auto header=div(screen); lv_obj_set_size(header,CONTENT_W,HEADER); lv_obj_set_pos(header,RAIL,0);
+    room_chip=tappable(header,LV_SIZE_CONTENT,72,ink::surface,ink::pressed,36,chip_clicked);
+    lv_obj_align(room_chip,LV_ALIGN_LEFT_MID,PAD-8,0);
+    lv_obj_set_ext_click_area(room_chip,12);
+    lv_obj_set_flex_flow(room_chip,LV_FLEX_FLOW_ROW); lv_obj_set_style_pad_hor(room_chip,28,0); lv_obj_set_style_pad_column(room_chip,14,0);
+    lv_obj_set_flex_align(room_chip,LV_FLEX_ALIGN_START,LV_FLEX_ALIGN_CENTER,LV_FLEX_ALIGN_CENTER);
+    text(room_chip,&font_body_26,ink::accent,LV_SYMBOL_HOME);
+    room_chip_name=text(room_chip,&font_body_32,ink::text,"Choose a room");
+    room_chip_extra=text(room_chip,&font_caption_22,ink::muted,"");
+    text(room_chip,&font_caption_22,ink::muted,LV_SYMBOL_DOWN);
+    auto right=row(header,20); lv_obj_set_size(right,LV_SIZE_CONTENT,HEADER); lv_obj_align(right,LV_ALIGN_RIGHT_MID,-PAD,0);
+    offline_label=text(right,&font_caption_22,ink::danger,""); lv_label_set_text_fmt(offline_label,"%s  Offline",LV_SYMBOL_WARNING);
+    lv_obj_add_flag(offline_label,LV_OBJ_FLAG_HIDDEN);
+    battery_label=text(right,&font_caption_22,ink::muted,"");
+}
+}
+
+// ---- public API ---------------------------------------------------------------------------
+void ui_build() {
+    auto display=lv_display_get_default();
+    lv_display_set_theme(display,lv_theme_default_init(display,c(ink::accent),c(ink::muted),true,&font_body_26));
+    auto screen=lv_screen_active();
+    lv_obj_set_style_bg_color(screen,c(ink::bg),0);
+    lv_obj_set_style_text_color(screen,c(ink::text),0);
+    lv_obj_set_style_text_font(screen,&font_body_26,0);
+    lv_obj_remove_flag(screen,LV_OBJ_FLAG_SCROLLABLE);
+    build_rail(screen);
+    build_header(screen);
+    void (*builders[5])(lv_obj_t*)={build_now_playing,build_favorites,build_queue,build_rooms,build_settings};
+    for(int i=0;i<5;++i) {
+        auto v=lv_obj_create(screen); lv_obj_remove_style_all(v);
+        lv_obj_set_size(v,CONTENT_W,CONTENT_H); lv_obj_set_pos(v,RAIL,HEADER);
+        lv_obj_set_scroll_dir(v,LV_DIR_VER); lv_obj_set_scrollbar_mode(v,LV_SCROLLBAR_MODE_ACTIVE);
+        lv_obj_set_style_pad_bottom(v,48,0);
+        views[i]=v;
+        builders[i](v);
+    }
+    lv_obj_remove_flag(views[0],LV_OBJ_FLAG_SCROLLABLE);
+    keyboard=lv_keyboard_create(lv_layer_top()); lv_obj_set_size(keyboard,W,320); lv_obj_align(keyboard,LV_ALIGN_BOTTOM_MID,0,0);
+    lv_obj_set_style_text_font(keyboard,&font_body_32,0);
+    lv_obj_add_event_cb(keyboard,[](lv_event_t*){ lv_obj_add_flag(keyboard,LV_OBJ_FLAG_HIDDEN); },LV_EVENT_READY,nullptr);
+    lv_obj_add_event_cb(keyboard,[](lv_event_t*){ lv_obj_add_flag(keyboard,LV_OBJ_FLAG_HIDDEN); lv_obj_add_flag(area_dialog,LV_OBJ_FLAG_HIDDEN); },LV_EVENT_CANCEL,nullptr);
+    lv_obj_add_flag(keyboard,LV_OBJ_FLAG_HIDDEN);
+    toast=div(lv_layer_top());
+    lv_obj_set_style_bg_opa(toast,LV_OPA_COVER,0); lv_obj_set_style_bg_color(toast,c(ink::raised),0);
+    lv_obj_set_style_radius(toast,LV_RADIUS_CIRCLE,0); lv_obj_set_style_pad_hor(toast,36,0); lv_obj_set_style_pad_ver(toast,20,0);
+    lv_obj_set_style_shadow_width(toast,40,0); lv_obj_set_style_shadow_opa(toast,LV_OPA_50,0);
+    lv_obj_set_size(toast,LV_SIZE_CONTENT,LV_SIZE_CONTENT); lv_obj_set_style_max_width(toast,900,0);
+    auto toast_text=text(toast,&font_body_26,ink::text,""); lv_label_set_long_mode(toast_text,LV_LABEL_LONG_DOT);
+    lv_obj_set_style_max_width(toast_text,828,0);
+    lv_obj_align(toast,LV_ALIGN_BOTTOM_MID,RAIL/2,-40);
+    lv_obj_add_flag(toast,LV_OBJ_FLAG_HIDDEN);
+    toast_timer=lv_timer_create(toast_hide,3500,nullptr); lv_timer_pause(toast_timer);
+    render_now_playing();
+    show_view(setting("ssid").empty()?View::Settings:View::NowPlaying);
+}
+void ui_show(View next) { DisplayLock lock; show_view(next); }
+View ui_view() { DisplayLock lock; return view; }
+sonos::Room ui_selected() { DisplayLock lock; return selected; }
+void ui_select(const std::string& id) {
+    // Called from LVGL callbacks (lock already held) and the worker; bsp's lock is recursive.
+    DisplayLock lock;
+    auto it=std::find_if(rooms.begin(),rooms.end(),[&](const sonos::Room& r){ return r.id==id; });
+    if(it==rooms.end() || it->id==selected.id) return;
+    selected=*it; have_state=false; current={};
+    now_art.set(Artwork{});
+    render_room_chip(); render_now_playing();
+}
+void ui_rooms(const std::vector<sonos::Room>& fresh) {
+    DisplayLock lock;
+    rooms=fresh;
+    auto it=std::find_if(rooms.begin(),rooms.end(),[&](const sonos::Room& r){ return r.id==selected.id; });
+    if(it!=rooms.end()) selected=*it;
+    else if(!rooms.empty()) { selected=rooms.front(); have_state=false; current={}; }
+    else selected={};
+    render_room_chip(); render_rooms(); render_now_playing();
+}
+void ui_favorites(const std::vector<sonos::Favorite>& fresh) { DisplayLock lock; favorites=fresh; render_favorites(); }
+void ui_favorite_art(const std::string& id,Artwork art) {
+    DisplayLock lock;
+    for(size_t i=0;i<favorites.size();++i) if(favorites[i].id==id) {
+        auto it=tiles.find(id+"#"+std::to_string(i));
+        if(it!=tiles.end()) it->second.art.set(std::move(art));
+        return;
+    }
+}
+void ui_state(const sonos::Room& room,const sonos::State& state) {
+    DisplayLock lock;
+    if(room.id!=selected.id) return;
+    current=state; have_state=true; position_at=esp_timer_get_time();
+    render_now_playing();
+}
+void ui_artwork(const sonos::Room& room,Artwork art) { DisplayLock lock; if(room.id==selected.id) now_art.set(std::move(art)); }
+void ui_queue(const sonos::Room& room,const std::vector<sonos::QueueItem>& items,int total,int track) {
+    DisplayLock lock;
+    if(room.id!=selected.id) return;
+    lv_obj_clean(queue_list);
+    if(!total) { lv_label_set_text(queue_header,"The queue is empty"); text(queue_list,&font_body_26,ink::muted,"Radio and streams play without a queue. Start an album or playlist from Favorites."); return; }
+    lv_label_set_text_fmt(queue_header,"Up next · %d tracks",total);
+    for(const auto& item:items) {
+        const bool now=item.number==track;
+        auto r=tappable(queue_list,CONTENT_W-2*PAD,96,now?ink::surface:ink::bg,ink::pressed,16,queue_clicked,reinterpret_cast<void*>(static_cast<uintptr_t>(item.number)));
+        lv_obj_set_style_pad_hor(r,24,0);
+        auto n=text(r,&font_caption_22,now?ink::accent:ink::faint,now?LV_SYMBOL_PLAY:std::to_string(item.number).c_str());
+        lv_obj_set_width(n,64); lv_obj_align(n,LV_ALIGN_LEFT_MID,0,0);
+        auto t=one_line(text(r,&font_body_26,now?ink::accent:ink::text,item.title.c_str()),CONTENT_W-2*PAD-48-88);
+        lv_obj_align(t,LV_ALIGN_TOP_LEFT,88,14);
+        auto a=one_line(text(r,&font_caption_22,ink::muted,item.artist.c_str()),CONTENT_W-2*PAD-48-88);
+        lv_obj_align(a,LV_ALIGN_BOTTOM_LEFT,88,-14);
+    }
+}
+void ui_summaries(const std::vector<std::pair<std::string,sonos::Summary>>& by_coordinator) {
+    DisplayLock lock;
+    summaries.clear();
+    for(auto& [id,s]:by_coordinator) summaries[id]=s;
+    if(view==View::Rooms && !group_mode) render_rooms();
+}
+void ui_areas(const std::vector<Area>& fresh) { DisplayLock lock; areas=fresh; render_rooms(); }
+void ui_battery(const Battery& b) {
+    DisplayLock lock;
+    battery=b; battery_known=true;
+    if(!b.present) { lv_label_set_text_fmt(battery_label,"%s  Powered",LV_SYMBOL_USB); return; }
+    const char* symbol=b.percent>85?LV_SYMBOL_BATTERY_FULL:b.percent>60?LV_SYMBOL_BATTERY_3:
+                       b.percent>35?LV_SYMBOL_BATTERY_2:b.percent>10?LV_SYMBOL_BATTERY_1:LV_SYMBOL_BATTERY_EMPTY;
+    lv_label_set_text_fmt(battery_label,"%s%s  %d%%",b.charging?LV_SYMBOL_CHARGE "  ":"",symbol,b.percent);
+    lv_obj_set_style_text_color(battery_label,c(b.percent<=10 && !b.charging?ink::danger:ink::muted),0);
+}
+void ui_online(bool now_online) { DisplayLock lock; online=now_online; lv_obj_set_flag(offline_label,LV_OBJ_FLAG_HIDDEN,online); }
+void ui_toast(const std::string& message,bool error) {
+    DisplayLock lock;
+    lv_label_set_text(lv_obj_get_child(toast,0),message.c_str());
+    lv_obj_set_style_bg_color(toast,c(error?0x4A2327:ink::raised),0);
+    lv_obj_remove_flag(toast,LV_OBJ_FLAG_HIDDEN); lv_obj_move_foreground(toast);
+    lv_timer_reset(toast_timer); lv_timer_resume(toast_timer);
+}

@@ -97,6 +97,19 @@ bool valid_ipv4(const std::string& ip) {
     }
     return true;
 }
+int parse_clock(const std::string& hms) {
+    int total = 0, parts = 0;
+    size_t start = 0;
+    while (start <= hms.size()) {
+        auto end = hms.find(':', start);
+        auto part = hms.substr(start, end == std::string::npos ? end : end - start);
+        try { total = total * 60 + number(part, 1000000); } catch (...) { return -1; }
+        ++parts;
+        if (end == std::string::npos) break;
+        start = end + 1;
+    }
+    return parts >= 2 && parts <= 3 ? total : -1;  // NOT_IMPLEMENTED and "" fail here
+}
 std::string ipv4_from_url(const std::string& url) {
     if (url.rfind("http://", 0) != 0) return "";
     auto end = url.find_first_of(":/", 7);
@@ -266,17 +279,32 @@ State Client::state(const Room& room) {
     auto v = call(room.ip,"RenderingControl","GetVolume",{{"InstanceID","0"},{"Channel","Master"}});
     auto m = call(room.ip,"RenderingControl","GetMute",{{"InstanceID","0"},{"Channel","Master"}});
     auto g = call(target.ip,"GroupRenderingControl","GetGroupVolume",{{"InstanceID","0"}});
+    auto gm = call(target.ip,"GroupRenderingControl","GetGroupMute",{{"InstanceID","0"}});
     State s;
     s.playback=t["CurrentTransportState"]; s.actions=a["Actions"];
     s.volume=number(v.at("CurrentVolume"),100); s.muted=m["CurrentMute"]=="1";
-    s.group_volume=number(g.at("CurrentVolume"),100);
+    s.group_volume=number(g.at("CurrentVolume"),100); s.group_muted=gm["CurrentMute"]=="1";
     try { s.track=p["Track"].empty() ? 0 : number(p["Track"]); } catch (...) { s.track=0; } // e.g. NOT_IMPLEMENTED
+    s.position=parse_clock(p["RelTime"]);
+    s.duration=parse_clock(p["TrackDuration"]);
+    if (s.duration <= 0) s.position = s.duration = -1;  // streams report 0:00:00
     if (!p["TrackMetaData"].empty() && p["TrackMetaData"]!="NOT_IMPLEMENTED") {
         tinyxml2::XMLDocument doc; parse(doc,p["TrackMetaData"]);
         s.title=text(descendant(doc.RootElement(),"title"));
         s.artist=text(descendant(doc.RootElement(),"creator"));
         s.album=text(descendant(doc.RootElement(),"album"));
         s.art=text(descendant(doc.RootElement(),"albumArtURI"));
+    }
+    return s;
+}
+Summary Client::summary(const Room& coordinator) {
+    auto p = call(coordinator.ip,"AVTransport","GetPositionInfo",{{"InstanceID","0"}});
+    auto t = call(coordinator.ip,"AVTransport","GetTransportInfo",{{"InstanceID","0"}});
+    Summary s; s.playback = t["CurrentTransportState"];
+    if (!p["TrackMetaData"].empty() && p["TrackMetaData"]!="NOT_IMPLEMENTED") {
+        tinyxml2::XMLDocument doc; parse(doc,p["TrackMetaData"]);
+        s.title=text(descendant(doc.RootElement(),"title"));
+        s.artist=text(descendant(doc.RootElement(),"creator"));
     }
     return s;
 }
@@ -320,8 +348,9 @@ void Client::volume(const Room& room, int value, bool group) {
     }
     else call(room.ip,"RenderingControl","SetVolume",{{"InstanceID","0"},{"Channel","Master"},{"DesiredVolume",std::to_string(value)}});
 }
-void Client::mute(const Room& room, bool value) {
-    call(room.ip,"RenderingControl","SetMute",{{"InstanceID","0"},{"Channel","Master"},{"DesiredMute",value?"1":"0"}});
+void Client::mute(const Room& room, bool value, bool group) {
+    if(group) call(coordinator(room).ip,"GroupRenderingControl","SetGroupMute",{{"InstanceID","0"},{"DesiredMute",value?"1":"0"}});
+    else call(room.ip,"RenderingControl","SetMute",{{"InstanceID","0"},{"Channel","Master"},{"DesiredMute",value?"1":"0"}});
 }
 void Client::join(const Room& room, const Room& destination) {
     auto target=coordinator(destination);

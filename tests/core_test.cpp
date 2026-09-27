@@ -357,6 +357,7 @@ void group_volume_and_state() {
         if (request.action == "GetVolume") return soap("<CurrentVolume>12</CurrentVolume>");
         if (request.action == "GetMute") return soap("<CurrentMute>1</CurrentMute>");
         if (request.action == "GetGroupVolume") return soap("<CurrentVolume>40</CurrentVolume>");
+        if (request.action == "GetGroupMute") return soap("<CurrentMute>1</CurrentMute>");
         return soap("");
     });
     const sonos::Room satellite{"RINCON_SAT", "Satellite", "192.168.1.3", "RINCON_COORD"};
@@ -369,9 +370,15 @@ void group_volume_and_state() {
     expect(requests[2].body.find("<DesiredVolume>30</DesiredVolume>") != std::string::npos, "group volume value missing");
 
     requests.clear();
+    client.mute(satellite, true, true);
+    expect(requests.size() == 1 && requests[0].action == "SetGroupMute" && requests[0].ip == "192.168.1.9",
+           "group mute should go to the coordinator");
+    expect(argument_names(requests[0]) == std::vector<std::string>({"InstanceID", "DesiredMute"}), "SetGroupMute arguments changed");
+
+    requests.clear();
     const auto state = client.state(satellite);
     expect(state.title == "Song" && state.artist == "Artist" && state.album == "Album" && state.art == "/art", "track metadata not parsed");
-    expect(state.playback == "PLAYING" && state.volume == 12 && state.muted && state.group_volume == 40 && state.track == 7,
+    expect(state.playback == "PLAYING" && state.volume == 12 && state.muted && state.group_volume == 40 && state.track == 7 && state.group_muted,
            "state values not parsed");
     for (const auto& request : requests) {
         const bool room_level = request.action == "GetVolume" || request.action == "GetMute";
@@ -448,6 +455,37 @@ void queue_and_track_playback() {
     expect_throw([&] { client.play_queue_track(satellite, 0); }, "queue track number below 1 accepted");
 }
 
+void clocks_and_summary() {
+    expect(sonos::parse_clock("0:03:25") == 205 && sonos::parse_clock("1:00:00") == 3600, "H:MM:SS not parsed");
+    expect(sonos::parse_clock("03:25") == 205, "MM:SS not parsed");
+    expect(sonos::parse_clock("NOT_IMPLEMENTED") == -1 && sonos::parse_clock("") == -1 && sonos::parse_clock("5") == -1,
+           "non-time accepted as a clock");
+    std::vector<sonos::Request> requests;
+    const std::string track = "<DIDL-Lite><item><dc:title>Song</dc:title><dc:creator>Artist</dc:creator></item></DIDL-Lite>";
+    std::string duration = "0:04:00";
+    sonos::Client client([&](const sonos::Request& request) {
+        requests.push_back(request);
+        if (request.action == "GetZoneGroupState") return topology("192.168.1.9", "RINCON_COORD");
+        if (request.action == "GetPositionInfo")
+            return soap("<Track>1</Track><TrackDuration>" + duration + "</TrackDuration><RelTime>0:01:30</RelTime><TrackMetaData>" +
+                        xml_escape(track) + "</TrackMetaData>");
+        if (request.action == "GetTransportInfo") return soap("<CurrentTransportState>PLAYING</CurrentTransportState>");
+        if (request.action == "GetVolume" || request.action == "GetGroupVolume") return soap("<CurrentVolume>5</CurrentVolume>");
+        if (request.action == "GetMute") return soap("<CurrentMute>0</CurrentMute>");
+        return soap("");
+    });
+    const sonos::Room coordinator{"RINCON_COORD", "Coordinator", "192.168.1.9", "RINCON_COORD"};
+    auto state = client.state(coordinator);
+    expect(state.position == 90 && state.duration == 240, "track position/duration not parsed");
+    duration = "0:00:00";
+    state = client.state(coordinator);
+    expect(state.position == -1 && state.duration == -1, "stream without duration reported a position");
+    requests.clear();
+    auto summary = client.summary(coordinator);
+    expect(requests.size() == 2 && summary.title == "Song" && summary.artist == "Artist" && summary.playback == "PLAYING",
+           "summary should take two calls and report title, artist and state");
+}
+
 int main() {
     try {
         parsing_and_validation();
@@ -457,6 +495,7 @@ int main() {
         update_changes_and_argument_order();
         grouping_and_areas();
         group_volume_and_state();
+        clocks_and_summary();
         queue_and_track_playback();
         std::cout << "core tests passed (" << checks << " assertions)\n";
         return EXIT_SUCCESS;

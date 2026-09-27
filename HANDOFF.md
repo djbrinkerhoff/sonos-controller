@@ -2,6 +2,29 @@
 
 Updated September 26, 2026 (second pass, same day). The device is now flashed, booting, on Wi-Fi, and talking to the real household speakers. The board bring-up blockers are resolved; the unproven product milestone is now audible playback.
 
+## Session 6: design pass
+
+The UI was redesigned over three passes. Each pass was deployed over the air and checked with `/screenshot`, using the new `/ui?view=0..4` endpoint to switch views remotely.
+
+- **Structure.** `firmware/main/ui.cpp` owns all LVGL code behind `ui.hpp`. `main.cpp` keeps the worker, settings and startup. `app.hpp` holds the `Command` and `Area` types they share.
+- **Information architecture.**
+  - Left navigation rail: Playing, Favorites, Queue, Rooms, and Settings at the bottom.
+  - The header room chip always shows which room (and group) the controls act on; tapping it opens Rooms.
+  - Transient toasts replace the old status line; an Offline marker appears in the header when Wi-Fi drops.
+- **Now Playing.** 480 px cover, 56 px title, artist and album, and a progress bar interpolated between polls (hidden for radio). A 128 px play/pause button with 104 px previous/next. One 56 px volume bar with a mute button: group volume and group mute when grouped (new core `GetGroupMute`/`SetGroupMute`), otherwise the room's. The Stop button and the separate room/group sliders are gone.
+- **Favorites.** A 5-column cover grid with two-line titles, and a badge only on Sonos Radio items. Tapping starts the favorite in the current room and switches to Now Playing. Thumbnails load in the background between polls:
+  - Apple art is requested centre-cropped (`400x400cc.jpg`); `bb` letterboxed the 4:1 playlist banners.
+  - Sonos Radio art (imgix) is requested as PNG, because imgix JPEGs are progressive and the P4 hardware decoder only reads baseline.
+  - A failed download is retried once.
+- **Queue.** Rows with the current track highlighted; tapping a row jumps to that track.
+- **Rooms.** Cards show each group's current track (a new two-call `Client::summary`). "Group rooms" switches the cards into checkboxes, and Done applies the choice via `apply_area`, replacing the old join/ungroup dropdowns. "Save as area" names the current group; saved areas appear as chips.
+- **Visual system.** Dark palette with a single amber accent; all tokens are in `ui.cpp`. Text is **Inter** (SIL OFL) at 56/32/26/22 px, plus a 52 px icon font. The fonts cover Latin-1, Latin Extended-A and typographic punctuation, so accented names and curly quotes render; the built-in Montserrat was ASCII-only. `tools/gen_fonts.sh` regenerates them, and the generated `.c` files are committed. Minimum tap target is 88 px (about 7.5 mm).
+- **Core:** track position/duration, `Summary`, group mute. 102 host assertions.
+
+**Not yet exercised by a person on the device:** tapping through Rooms group mode, the area-naming dialog with the keyboard, and the toasts.
+
+**Decision:** the user chose to keep the Wi-Fi password in ordinary NVS; no NVS encryption and no eFuse burn.
+
 ## Session 5: appliance features
 
 Built partly by four parallel Devin SWE-2 workers in Superset workspaces (queue core, artwork, power/IMU, events+OTA), then integrated and debugged on the hardware. Everything below runs on the Tab5 unless marked untested.
@@ -37,7 +60,7 @@ Built partly by four parallel Devin SWE-2 workers in Superset workspaces (queue 
 
 **Signing key.** `firmware/keys/ota_signing_key.pem` is gitignored and exists only on this Mac. **Back it up.** Without it, updates go back to USB.
 
-**Wi-Fi credential protection: not done, needs a decision.** The robust option (NVS encryption keyed by an HMAC eFuse key) permanently burns a key block in the chip. It is irreversible, so it was not done without the user's approval.
+**Wi-Fi credential protection:** the user decided (session 6) to keep the password in ordinary NVS.
 
 ## Session 4: discovery fixed
 

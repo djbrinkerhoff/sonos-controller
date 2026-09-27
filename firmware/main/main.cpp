@@ -3,7 +3,8 @@
 #include "screen.hpp"
 #include "power.hpp"
 #include "artwork.hpp"
-#include "misc/cache/instance/lv_image_cache.h"
+#include "app.hpp"
+#include "ui.hpp"
 #include "events.hpp"
 #include "ota.hpp"
 #include "debug.hpp"
@@ -33,25 +34,10 @@
 
 namespace {
 const char* TAG="controller";
-struct Command {
-    std::string action, ssid, password, seed;
-    sonos::Room room, destination;
-    sonos::Favorite favorite;
-    int value=0;
-    std::vector<std::string> area_ids;
-};
 QueueHandle_t commands;
 sonos::Client client(soap_http);
-std::vector<sonos::Room> rooms;
-std::vector<sonos::Favorite> favorites;
-sonos::Room selected;
-sonos::State current;
 std::string seed;
-lv_obj_t *status_label,*room_select,*favorite_list,*title_label,*artist_label,*volume_slider,*volume_label;
-lv_obj_t *ssid_input,*password_input,*seed_input,*keyboard,*join_select,*tabs,*play_button,*next_button,*prev_button,*mute_button;
-lv_obj_t *group_slider,*group_label,*area_name,*area_list;
-lv_obj_t *battery_label,*art_box,*art_image,*art_placeholder,*queue_list;
-struct Area {std::string name; std::vector<std::string> ids;};
+std::vector<sonos::Favorite> favorites;  // the worker's copy, for artwork thumbnails
 std::vector<Area> areas;
 bool initialized=false;
 bool storage_ok=true;
@@ -60,17 +46,6 @@ bool catalog_loaded=false;
 std::atomic<bool> event_pending{false}, topology_event{false};
 std::atomic<TickType_t> last_event{0};
 
-struct DisplayLock { DisplayLock(){bsp_display_lock(0);} ~DisplayLock(){bsp_display_unlock();} };
-std::string setting(const char* key) {
-    nvs_handle_t handle;
-    if(nvs_open("controller",NVS_READONLY,&handle)!=ESP_OK) return "";
-    size_t len=0; std::string value;
-    if(nvs_get_str(handle,key,nullptr,&len)==ESP_OK && len<=4096) {
-        value.resize(len); nvs_get_str(handle,key,value.data(),&len);
-        if(!value.empty()) value.pop_back();
-    }
-    nvs_close(handle); return value;
-}
 void load_areas() {
     for(int i=0;i<8;++i) {
         auto data=setting(("area"+std::to_string(i)).c_str());
@@ -80,16 +55,14 @@ void load_areas() {
         if(!area.name.empty() && !area.ids.empty()) areas.push_back(std::move(area));
     }
 }
-void render_areas();
 void save_area(const Command& command) {
-    if(command.ssid.empty() || command.ssid.size()>32 || command.ssid.find('\n')!=std::string::npos)
+    if(command.name.empty() || command.name.size()>32 || command.name.find('\n')!=std::string::npos)
         throw std::runtime_error("Name the area using 1 to 32 characters");
     auto topology=client.rooms(command.room.ip);
     auto selected_room=std::find_if(topology.begin(),topology.end(),[&](const sonos::Room& r){return r.id==command.room.id;});
     if(selected_room==topology.end()) throw std::runtime_error("Selected room is unavailable");
-    Area area; area.name=command.ssid;
+    Area area; area.name=command.name;
     for(const auto& r:topology) if(r.coordinator==selected_room->coordinator) area.ids.push_back(r.id);
-    DisplayLock lock;
     auto found=std::find_if(areas.begin(),areas.end(),[&](const Area& a){return a.name==area.name;});
     size_t index=found==areas.end()?areas.size():static_cast<size_t>(found-areas.begin());
     if(index>=8) throw std::runtime_error("Eight areas are saved. Reuse a name to replace one.");
@@ -102,7 +75,8 @@ void save_area(const Command& command) {
     nvs_close(handle);
     if(result!=ESP_OK) throw std::runtime_error("Area could not be saved");
     if(index==areas.size()) areas.push_back(area); else areas[index]=area;
-    render_areas();
+    ui_areas(areas);
+    ui_toast("Saved "+area.name);
 }
 void save_settings(const Command& command) {
     nvs_handle_t handle;
@@ -130,304 +104,15 @@ void save_known_speakers(const std::vector<sonos::Room>& found) {
     if(nvs_set_str(handle,"speakers",value.c_str())==ESP_OK) nvs_commit(handle);
     nvs_close(handle);
 }
-void status(const std::string& text) { DisplayLock lock; lv_label_set_text(status_label,text.c_str()); }
-void enqueue(Command* command) {
-    if(xQueueSend(commands,&command,0)!=pdTRUE) {
-        delete command;
-        lv_label_set_text(status_label,"Please wait for the current action.");
-    } else lv_label_set_text(status_label,"Working...");
-}
-lv_obj_t* label(lv_obj_t* parent,const char* text) {
-    auto obj=lv_label_create(parent); lv_label_set_text(obj,text); return obj;
-}
-lv_obj_t* button(lv_obj_t* parent,const char* text,lv_event_cb_t callback,void* data=nullptr) {
-    auto obj=lv_button_create(parent); lv_obj_set_height(obj,76);
-    lv_obj_set_style_radius(obj,14,0);
-    auto l=label(obj,text); lv_obj_center(l);
-    lv_obj_add_event_cb(obj,callback,LV_EVENT_CLICKED,data); return obj;
-}
-void send_action(lv_event_t* event) {
-    if(selected.id.empty()) return;
-    auto command=new Command;
-    command->room=selected;
-    command->action=static_cast<const char*>(lv_event_get_user_data(event));
-    if(command->action=="Toggle") command->action=current.playback=="PLAYING" ? "Pause" : "Play";
-    if(command->action=="Mute") command->value=!current.muted;
-    enqueue(command);
-}
-void room_changed(lv_event_t*) {
-    auto index=lv_dropdown_get_selected(room_select);
-    if(index<rooms.size()) {
-        selected=rooms[index]; current={};
-        lv_label_set_text(title_label,"Loading room..."); lv_label_set_text(artist_label,"");
-        auto c=new Command; c->action="Poll"; c->room=selected; enqueue(c);
-    }
-}
-void favorite_clicked(lv_event_t* event) {
-    auto index=reinterpret_cast<uintptr_t>(lv_event_get_user_data(event));
-    if(selected.id.empty() || index>=favorites.size()) return;
-    auto c=new Command; c->action="Favorite"; c->room=selected; c->favorite=favorites[index]; enqueue(c);
-}
 // Runs in the LVGL task. Sleep may have hidden external changes, so fetch
-// fresh topology and state straight away without a "Working..." status.
-void screen_woke() {
-    auto c=new Command; c->action="Wake"; c->room=selected;
-    if(xQueueSend(commands,&c,0)!=pdTRUE) delete c;
-}
-void queue_clicked(lv_event_t* event) {
-    if(selected.id.empty()) return;
-    auto c=new Command; c->action="QueueTrack"; c->room=selected;
-    c->value=static_cast<int>(reinterpret_cast<uintptr_t>(lv_event_get_user_data(event)));
-    enqueue(c);
-}
-void tab_changed(lv_event_t*) {
-    if(lv_tabview_get_tab_active(tabs)!=2 || selected.id.empty()) return;
-    auto c=new Command; c->action="Queue"; c->room=selected;
-    if(xQueueSend(commands,&c,0)!=pdTRUE) delete c;
-}
-void render_queue(const sonos::Room& target,const std::vector<sonos::QueueItem>& items,int total,int track) {
-    DisplayLock lock;
-    if(target.id!=selected.id) return;
-    lv_obj_clean(queue_list);
-    if(items.empty()) { label(queue_list,total?"Nothing further in the queue.":"The queue is empty. Radio and streams do not use it."); return; }
-    auto header=label(queue_list,""); lv_label_set_text_fmt(header,"%d tracks in the queue",total);
-    for(const auto& item:items) {
-        std::string text=std::to_string(item.number)+"   "+item.title+(item.artist.empty()?"":"\n       "+item.artist);
-        auto b=button(queue_list,text.c_str(),queue_clicked,reinterpret_cast<void*>(static_cast<uintptr_t>(item.number)));
-        lv_obj_set_size(b,lv_pct(100),96);
-        auto l=lv_obj_get_child(b,0); lv_obj_set_width(l,lv_pct(96)); lv_label_set_long_mode(l,LV_LABEL_LONG_DOT);
-        lv_obj_align(l,LV_ALIGN_LEFT_MID,0,0);
-        if(item.number==track) lv_obj_add_state(b,LV_STATE_CHECKED);
-        else lv_obj_set_style_bg_color(b,lv_color_hex(0x252c33),0);
-    }
-}
-void refresh_clicked(lv_event_t*) { auto c=new Command; c->action="Refresh"; enqueue(c); }
-void volume_changed(lv_event_t* event) {
-    int value=lv_slider_get_value(volume_slider);
-    lv_label_set_text_fmt(volume_label,"Room volume   %d",value);
-    if(lv_event_get_code(event)==LV_EVENT_RELEASED && !selected.id.empty()) {
-        auto c=new Command; c->action="Volume"; c->room=selected; c->value=value; enqueue(c);
-    }
-}
-void group_volume_changed(lv_event_t* event) {
-    int value=lv_slider_get_value(group_slider);
-    lv_label_set_text_fmt(group_label,"Group volume   %d",value);
-    if(lv_event_get_code(event)==LV_EVENT_RELEASED && !selected.id.empty()) {
-        auto c=new Command; c->action="GroupVolume"; c->room=selected; c->value=value; enqueue(c);
-    }
-}
-void area_save_clicked(lv_event_t*) {
-    if(selected.id.empty()) return;
-    auto c=new Command; c->action="SaveArea"; c->room=selected; c->ssid=lv_textarea_get_text(area_name);
-    lv_obj_add_flag(keyboard,LV_OBJ_FLAG_HIDDEN); enqueue(c);
-}
-void area_clicked(lv_event_t* event) {
-    auto index=reinterpret_cast<uintptr_t>(lv_event_get_user_data(event));
-    if(index>=areas.size()) return;
-    auto c=new Command; c->action="Area"; c->area_ids=areas[index].ids; enqueue(c);
-}
-void render_areas() {
-    lv_obj_clean(area_list);
-    for(size_t i=0;i<areas.size();++i) {
-        auto b=button(area_list,areas[i].name.c_str(),area_clicked,reinterpret_cast<void*>(i));
-        lv_obj_set_width(b,lv_pct(100));
-    }
-}
-void group_clicked(lv_event_t* event) {
-    auto index=lv_dropdown_get_selected(join_select);
-    if(selected.id.empty() || index>=rooms.size()) return;
-    auto c=new Command; c->action=static_cast<const char*>(lv_event_get_user_data(event));
-    c->room=selected; c->destination=rooms[index]; enqueue(c);
-}
-void input_focus(lv_event_t* event) {
-    lv_keyboard_set_textarea(keyboard,lv_event_get_target_obj(event));
-    lv_obj_remove_flag(keyboard,LV_OBJ_FLAG_HIDDEN);
-}
-void connect_clicked(lv_event_t*) {
-    auto c=new Command; c->action="Connect";
-    c->ssid=lv_textarea_get_text(ssid_input); c->password=lv_textarea_get_text(password_input);
-    c->seed=lv_textarea_get_text(seed_input);
-    lv_obj_add_flag(keyboard,LV_OBJ_FLAG_HIDDEN); enqueue(c);
-}
-lv_obj_t* input(lv_obj_t* parent,const char* placeholder,bool password=false) {
-    auto obj=lv_textarea_create(parent); lv_textarea_set_one_line(obj,true);
-    lv_textarea_set_password_mode(obj,password); lv_textarea_set_placeholder_text(obj,placeholder);
-    lv_obj_set_width(obj,720); lv_obj_add_event_cb(obj,input_focus,LV_EVENT_FOCUSED,nullptr); return obj;
-}
-void column(lv_obj_t* obj) { lv_obj_set_flex_flow(obj,LV_FLEX_FLOW_COLUMN); lv_obj_set_style_pad_row(obj,18,0); }
-void render_catalog(std::vector<sonos::Room> new_rooms,std::vector<sonos::Favorite> new_favorites) {
-    DisplayLock lock;
-    rooms=std::move(new_rooms); favorites=std::move(new_favorites);
-    std::string options; uint32_t index=0;
-    for(size_t i=0;i<rooms.size();++i) {
-        if(i) options+='\n';
-        options+=rooms[i].name;
-        if(rooms[i].id==selected.id) index=i;
-    }
-    lv_dropdown_set_options(room_select,options.empty()?"No rooms found":options.c_str());
-    lv_dropdown_set_options(join_select,options.empty()?"No rooms found":options.c_str());
-    selected=rooms.empty()?sonos::Room{}:rooms[index];
-    lv_dropdown_set_selected(room_select,index);
-    lv_obj_clean(favorite_list);
-    if(favorites.empty()) {
-        auto l=label(favorite_list,"No supported favorites yet.\nAdd Apple Music or Sonos Radio favorites in the Sonos app, then Refresh.");
-        lv_obj_set_width(l,lv_pct(100));
-    }
-    for(size_t i=0;i<favorites.size();++i) {
-        auto b=button(favorite_list,(favorites[i].title+"\n"+favorites[i].provider).c_str(),favorite_clicked,reinterpret_cast<void*>(i));
-        lv_obj_set_size(b,lv_pct(100),104);
-        auto l=lv_obj_get_child(b,0); lv_obj_set_width(l,lv_pct(95)); lv_label_set_long_mode(l,LV_LABEL_LONG_DOT);
-    }
-}
-// The pixels behind art_image; replaced only with the display lock held.
-Artwork art_pixels;
-lv_image_dsc_t art_dsc{};
-void render_artwork(const sonos::Room& target,Artwork art) {
-    DisplayLock lock;
-    if(target.id!=selected.id) return;
-    lv_image_set_src(art_image,nullptr);
-    lv_image_cache_drop(&art_dsc);
-    art_pixels=std::move(art);
-    const bool shown=art_pixels.pixels!=nullptr;
-    if(shown) {
-        art_dsc=lv_image_dsc_t{};
-        art_dsc.header.magic=LV_IMAGE_HEADER_MAGIC; art_dsc.header.cf=LV_COLOR_FORMAT_RGB565;
-        art_dsc.header.w=art_pixels.width; art_dsc.header.h=art_pixels.height; art_dsc.header.stride=art_pixels.stride;
-        art_dsc.data_size=art_pixels.stride*art_pixels.height; art_dsc.data=art_pixels.pixels;
-        lv_image_set_src(art_image,&art_dsc);
-        // Small artwork is scaled up to fill the panel rather than floating in it.
-        const uint32_t side=std::max(art_pixels.width,art_pixels.height);
-        lv_image_set_scale(art_image,side<400?400*256/side:256);
-        lv_obj_center(art_image);
-    }
-    lv_obj_set_flag(art_image,LV_OBJ_FLAG_HIDDEN,!shown);
-    lv_obj_set_flag(art_placeholder,LV_OBJ_FLAG_HIDDEN,shown);
-}
+// fresh topology and state straight away.
+void screen_woke() { auto c=new Command; c->action="Wake"; submit(c); }
 void speaker_event(const char* service) {
     last_event=xTaskGetTickCount();
     if(!std::strcmp(service,"ZoneGroupTopology")) topology_event=true;
     if(event_pending.exchange(true)) return; // one refresh covers a burst
     auto c=new Command; c->action="Event";
-    if(xQueueSend(commands,&c,0)!=pdTRUE) { delete c; event_pending=false; }
-}
-void render_battery(const Battery& battery) {
-    DisplayLock lock;
-    if(!battery.present) { lv_label_set_text(battery_label,LV_SYMBOL_USB); return; }
-    const char* symbol=battery.percent>85?LV_SYMBOL_BATTERY_FULL:battery.percent>60?LV_SYMBOL_BATTERY_3:
-                       battery.percent>35?LV_SYMBOL_BATTERY_2:battery.percent>10?LV_SYMBOL_BATTERY_1:LV_SYMBOL_BATTERY_EMPTY;
-    lv_label_set_text_fmt(battery_label,"%s%s %d%%",battery.charging?LV_SYMBOL_CHARGE " ":"",symbol,battery.percent);
-}
-void render_state(const sonos::Room& target,const sonos::State& state) {
-    DisplayLock lock;
-    if(target.id!=selected.id) return;
-    current=state;
-    lv_label_set_text(title_label,state.title.empty()?"Nothing playing":state.title.c_str());
-    lv_label_set_text(artist_label,(state.artist+ (state.album.empty()?"":"  -  "+state.album)).c_str());
-    if(!lv_obj_has_state(volume_slider,LV_STATE_PRESSED)) {
-        lv_slider_set_value(volume_slider,state.volume,LV_ANIM_OFF);
-        lv_label_set_text_fmt(volume_label,"Room volume   %d",state.volume);
-    }
-    if(!lv_obj_has_state(group_slider,LV_STATE_PRESSED)) {
-        lv_slider_set_value(group_slider,state.group_volume,LV_ANIM_OFF);
-        lv_label_set_text_fmt(group_label,"Group volume   %d",state.group_volume);
-    }
-    lv_label_set_text(lv_obj_get_child(play_button,0),state.playback=="PLAYING"?LV_SYMBOL_PAUSE:LV_SYMBOL_PLAY);
-    lv_label_set_text(lv_obj_get_child(mute_button,0),state.muted?LV_SYMBOL_VOLUME_MAX:LV_SYMBOL_MUTE);
-    auto supports=[&](const char* action) {
-        auto values=","+state.actions+",";
-        return values.find(std::string(",")+action+",")!=std::string::npos;
-    };
-    lv_obj_set_state(next_button,LV_STATE_DISABLED,!supports("Next"));
-    lv_obj_set_state(prev_button,LV_STATE_DISABLED,!supports("Previous"));
-    lv_label_set_text(status_label,network_online()?"Connected - local control":"Wi-Fi disconnected");
-}
-void build_ui() {
-    auto display=lv_display_get_default();
-    lv_display_set_theme(display,lv_theme_default_init(display,lv_palette_main(LV_PALETTE_TEAL),lv_palette_main(LV_PALETTE_GREY),true,&lv_font_montserrat_28));
-    auto screen=lv_screen_active();
-    lv_obj_set_style_bg_color(screen,lv_color_hex(0x101419),0);
-    lv_obj_set_style_text_color(screen,lv_color_hex(0xf2f4f6),0);
-    room_select=lv_dropdown_create(screen); lv_obj_set_size(room_select,480,64);
-    lv_obj_align(room_select,LV_ALIGN_TOP_LEFT,20,12); lv_dropdown_set_options(room_select,"Choose a room");
-    lv_obj_add_event_cb(room_select,room_changed,LV_EVENT_VALUE_CHANGED,nullptr);
-    battery_label=label(screen,""); lv_obj_align(battery_label,LV_ALIGN_TOP_RIGHT,-24,28);
-    tabs=lv_tabview_create(screen); lv_obj_set_size(tabs,lv_pct(100),720-88-48); lv_obj_align(tabs,LV_ALIGN_TOP_MID,0,88);
-    lv_tabview_set_tab_bar_size(tabs,72);
-    lv_obj_add_event_cb(tabs,tab_changed,LV_EVENT_VALUE_CHANGED,nullptr);
-    auto now=lv_tabview_add_tab(tabs,"Now Playing");
-    auto fav=lv_tabview_add_tab(tabs,"Favorites"); column(fav);
-    auto queue=lv_tabview_add_tab(tabs,"Queue"); column(queue);
-    auto group=lv_tabview_add_tab(tabs,"Rooms"); column(group);
-    auto setup=lv_tabview_add_tab(tabs,"Settings"); column(setup);
-
-    // Now Playing: artwork on the left, track and controls on the right.
-    lv_obj_set_flex_flow(now,LV_FLEX_FLOW_ROW); lv_obj_set_style_pad_column(now,32,0);
-    art_box=lv_obj_create(now); lv_obj_set_size(art_box,400,400); lv_obj_remove_flag(art_box,LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_style_radius(art_box,18,0); lv_obj_set_style_pad_all(art_box,0,0); lv_obj_set_style_clip_corner(art_box,true,0);
-    art_placeholder=label(art_box,LV_SYMBOL_AUDIO); lv_obj_set_style_text_font(art_placeholder,&lv_font_montserrat_48,0); lv_obj_center(art_placeholder);
-    art_image=lv_image_create(art_box); lv_obj_center(art_image); lv_obj_add_flag(art_image,LV_OBJ_FLAG_HIDDEN);
-    auto info=lv_obj_create(now); lv_obj_remove_style_all(info); column(info);
-    lv_obj_set_height(info,lv_pct(100)); lv_obj_set_flex_grow(info,1); lv_obj_set_style_pad_row(info,14,0);
-    title_label=label(info,"Nothing playing"); lv_obj_set_width(title_label,lv_pct(100));
-    lv_obj_set_style_text_font(title_label,&lv_font_montserrat_48,0); lv_label_set_long_mode(title_label,LV_LABEL_LONG_DOT);
-    lv_obj_set_style_max_height(title_label,120,0);
-    artist_label=label(info,""); lv_obj_set_width(artist_label,lv_pct(100)); lv_label_set_long_mode(artist_label,LV_LABEL_LONG_DOT);
-    lv_obj_set_style_text_color(artist_label,lv_color_hex(0xaab4be),0);
-    auto controls=lv_obj_create(info); lv_obj_remove_style_all(controls); lv_obj_set_size(controls,lv_pct(100),LV_SIZE_CONTENT);
-    lv_obj_set_flex_flow(controls,LV_FLEX_FLOW_ROW); lv_obj_set_style_pad_column(controls,16,0);
-    auto transport_button=[&](const char* text,const char* action) {
-        auto b=button(controls,text,send_action,(void*)action); lv_obj_set_size(b,120,96);
-        lv_obj_set_style_text_font(lv_obj_get_child(b,0),&lv_font_montserrat_36,0); return b;
-    };
-    prev_button=transport_button(LV_SYMBOL_PREV,"Previous");
-    play_button=transport_button(LV_SYMBOL_PLAY,"Toggle");
-    next_button=transport_button(LV_SYMBOL_NEXT,"Next");
-    transport_button(LV_SYMBOL_STOP,"Stop");
-    mute_button=transport_button(LV_SYMBOL_MUTE,"Mute");
-    volume_label=label(info,"Room volume");
-    volume_slider=lv_slider_create(info); lv_obj_set_size(volume_slider,lv_pct(92),32); lv_slider_set_range(volume_slider,0,100);
-    lv_obj_add_event_cb(volume_slider,volume_changed,LV_EVENT_VALUE_CHANGED,nullptr);
-    lv_obj_add_event_cb(volume_slider,volume_changed,LV_EVENT_RELEASED,nullptr);
-    group_label=label(info,"Group volume");
-    group_slider=lv_slider_create(info); lv_obj_set_size(group_slider,lv_pct(92),32); lv_slider_set_range(group_slider,0,100);
-    lv_obj_add_event_cb(group_slider,group_volume_changed,LV_EVENT_VALUE_CHANGED,nullptr);
-    lv_obj_add_event_cb(group_slider,group_volume_changed,LV_EVENT_RELEASED,nullptr);
-
-    button(fav,"Refresh favorites",refresh_clicked);
-    favorite_list=lv_obj_create(fav); lv_obj_set_size(favorite_list,lv_pct(100),LV_SIZE_CONTENT); column(favorite_list);
-    label(favorite_list,"Connect to Wi-Fi in Settings to find your Sonos system.");
-
-    queue_list=lv_obj_create(queue); lv_obj_set_size(queue_list,lv_pct(100),LV_SIZE_CONTENT); column(queue_list);
-    label(queue_list,"Open this tab while music is playing to see what's next.");
-
-    auto group_info=label(group,"The room selected above will join the destination below.\nJoining changes what plays in that room; the destination keeps playing."); lv_obj_set_width(group_info,lv_pct(100));
-    join_select=lv_dropdown_create(group); lv_obj_set_width(join_select,560); lv_dropdown_set_options(join_select,"Choose destination");
-    button(group,"Join selected room to destination",group_clicked,(void*)"Join");
-    button(group,"Ungroup selected room",group_clicked,(void*)"Ungroup");
-    button(group,"Refresh rooms",refresh_clicked);
-    auto area_info=label(group,"Save the selected room's current group as an area.\nApplying an area regroups its rooms and can interrupt their current music."); lv_obj_set_width(area_info,lv_pct(100));
-    area_name=input(group,"Area name, e.g. Downstairs"); lv_textarea_set_max_length(area_name,32);
-    button(group,"Save current group as area",area_save_clicked);
-    area_list=lv_obj_create(group); lv_obj_set_size(area_list,lv_pct(100),LV_SIZE_CONTENT); column(area_list);
-    load_areas(); render_areas();
-
-    ssid_input=input(setup,"Wi-Fi name (2.4 GHz)"); lv_textarea_set_max_length(ssid_input,32);
-    password_input=input(setup,"Wi-Fi password",true); lv_textarea_set_max_length(password_input,63);
-    seed_input=input(setup,"Optional Sonos speaker IP"); lv_textarea_set_max_length(seed_input,15);
-    lv_textarea_set_accepted_chars(seed_input,"0123456789.");
-    lv_textarea_set_text(ssid_input,setting("ssid").c_str());
-    lv_textarea_set_text(password_input,setting("password").c_str());
-    lv_textarea_set_text(seed_input,setting("seed").c_str());
-    button(setup,"Connect & save",connect_clicked);
-    label(setup,"Prototype - standalone - Apple Music + Sonos Radio favorites");
-
-    status_label=label(screen,"Starting..."); lv_obj_set_width(status_label,lv_pct(95)); lv_obj_align(status_label,LV_ALIGN_BOTTOM_LEFT,24,-8);
-    lv_obj_set_style_text_font(status_label,&lv_font_montserrat_22,0);
-    lv_label_set_long_mode(status_label,LV_LABEL_LONG_DOT);
-    keyboard=lv_keyboard_create(screen); lv_obj_set_size(keyboard,lv_pct(100),lv_pct(44)); lv_obj_add_flag(keyboard,LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_event_cb(keyboard,[](lv_event_t*){lv_obj_add_flag(keyboard,LV_OBJ_FLAG_HIDDEN);},LV_EVENT_READY,nullptr);
-    lv_obj_add_event_cb(keyboard,[](lv_event_t*){lv_obj_add_flag(keyboard,LV_OBJ_FLAG_HIDDEN);},LV_EVENT_CANCEL,nullptr);
-    if(setting("ssid").empty()) lv_tabview_set_active(tabs,4,LV_ANIM_OFF);
+    if(!submit(c)) event_pending=false;
 }
 void refresh() {
     if(!network_online()) throw std::runtime_error("Wi-Fi is disconnected");
@@ -447,11 +132,26 @@ void refresh() {
     if(discovered) { seed=discover_speaker(); found=client.rooms(seed); }
     ESP_LOGI(TAG,"Using speaker %s (%s), %u rooms",seed.c_str(),discovered?"discovered":"stored",static_cast<unsigned>(found.size()));
     save_known_speakers(found);
-    auto f=client.favorites(seed);
-    render_catalog(std::move(found),std::move(f));
+    favorites=client.favorites(seed);
+    ui_rooms(found);
+    ui_favorites(favorites);
     catalog_loaded=true;
     ota_mark_healthy(); // a new image proves itself by reaching the speakers
 }
+// Favorite tiles only need ~200 px art. Apple's image CDN serves any size by
+// file name; "cc" centre-crops to a square, where "bb" would letterbox the
+// 4:1 banners editorial playlists use. imgix (Sonos Radio) serves progressive
+// JPEGs, which the P4's hardware decoder cannot read, and its existing
+// auto=format overrides fm, so the whole query is replaced to get a PNG.
+std::string thumbnail_url(const std::string& uri) {
+    if(uri.find("mzstatic.com/")!=std::string::npos) {
+        auto slash=uri.rfind('/'); auto name=uri.substr(slash+1);
+        if(name.find('x')!=std::string::npos && name.find('.')!=std::string::npos) return uri.substr(0,slash+1)+"400x400cc.jpg";
+    }
+    if(uri.find("imgix.net/")!=std::string::npos) return uri.substr(0,uri.find('?'))+"?w=200&h=200&fit=crop&fm=png";
+    return uri;
+}
+
 void worker(void*) {
     try {
         if(bsp_feature_enable(BSP_FEATURE_WIFI,true)!=ESP_OK) throw std::runtime_error("Cannot power the Wi-Fi module");
@@ -462,57 +162,69 @@ void worker(void*) {
         events_start(speaker_event);
         if(auto server=events_server()) { ota_register(server); debug_register(server); }
     }
-    catch(const std::exception& e) { status(e.what()); ESP_LOGE(TAG,"Startup failed: %s",e.what()); }
+    catch(const std::exception& e) { ui_toast(e.what(),true); ESP_LOGE(TAG,"Startup failed: %s",e.what()); }
+    load_areas(); ui_areas(areas);
     auto boot=new Command; boot->action="Connect"; boot->ssid=setting("ssid"); boot->password=setting("password"); boot->seed=setting("seed");
-    if(!boot->ssid.empty()) { if(xQueueSend(commands,&boot,0)!=pdTRUE) delete boot; }
-    else { delete boot; status(storage_ok?"Open Settings to connect to your home Wi-Fi.":"Settings storage failed; settings will not be saved. Open Settings to connect."); }
-    TickType_t last_catalog_attempt=0, last_topology=0, last_battery=0;
-    int queue_track=-1; std::string queue_room; // what the Queue tab currently shows
+    if(!boot->ssid.empty()) submit(boot);
+    else { delete boot; ui_toast(storage_ok?"Connect to your home Wi-Fi to find your speakers.":"Settings storage failed; settings will not be saved.",!storage_ok); }
+    TickType_t last_catalog_attempt=0, last_topology=0, last_battery=0, next_poll=0, last_rooms=0;
+    int queue_track=-1; std::string queue_room;  // what the Queue view shows
+    std::string art_uri="\x01", art_room;          // what the artwork panel shows
     std::vector<EventTarget> subscribed; TickType_t subscribed_at=0;
-    std::string art_uri="\x01", art_room;         // what the artwork panel currently shows
+    size_t next_thumbnail=0;
+    std::vector<size_t> thumbnail_retries;  // one more try for transient download failures
+    bool was_online=false;
     for(;;) {
-        Command* raw=nullptr;
         // Sonos answers a new subscription with a full-state event, so an event
         // since subscribing proves events work and polling can relax.
         const bool events_live=subscribed_at && last_event.load()>=subscribed_at;
-        xQueueReceive(commands,&raw,pdMS_TO_TICKS(events_live?15000:4000));
+        const TickType_t now=xTaskGetTickCount();
+        // Favorite artwork loads in the gaps between polls and commands.
+        const bool thumbnails_pending=catalog_loaded && (next_thumbnail<favorites.size() || !thumbnail_retries.empty()) && !screen_off();
+        const TickType_t wait=thumbnails_pending?0:(next_poll>now?next_poll-now:0);
+        Command* raw=nullptr;
+        xQueueReceive(commands,&raw,wait);
         std::unique_ptr<Command> c(raw);
         try {
+            if(network_online()!=was_online) { was_online=!was_online; ui_online(was_online); }
             // A boot-time connect can fail while the router is down; the Wi-Fi
             // layer keeps retrying, so load the catalog once it comes back.
             if(!c && initialized && !catalog_loaded && network_online() &&
                xTaskGetTickCount()-last_catalog_attempt>pdMS_TO_TICKS(30000)) {
                 last_catalog_attempt=xTaskGetTickCount();
-                refresh();
+                refresh(); next_thumbnail=0; thumbnail_retries.clear();
             }
             if(c) {
+                const auto& a=c->action;
                 if(!initialized) throw std::runtime_error("Wi-Fi hardware failed to initialize. Restart the controller.");
-                if(c->action=="Connect") {
-                    if(!c->seed.empty() && !sonos::valid_ipv4(c->seed)) throw std::runtime_error("Enter a valid speaker IPv4 address");
-                    status("Connecting to Wi-Fi..."); network_connect(c->ssid,c->password); if(storage_ok) save_settings(*c); seed=c->seed; refresh();
-                } else if(c->action=="Refresh") refresh();
-                else if(c->action=="Favorite") client.play_favorite(c->room,c->favorite);
-                else if(c->action=="Volume") client.volume(c->room,c->value);
-                else if(c->action=="GroupVolume") client.volume(c->room,c->value,true);
-                else if(c->action=="SaveArea") save_area(*c);
-                else if(c->action=="Area") {
-                    client.apply_area(seed,c->area_ids); refresh();
-                    DisplayLock lock;
-                    for(size_t i=0;i<rooms.size();++i) if(rooms[i].id==c->area_ids.front()) {selected=rooms[i]; lv_dropdown_set_selected(room_select,i); break;}
+                if(a=="Connect") {
+                    if(!c->seed.empty() && !sonos::valid_ipv4(c->seed)) throw std::runtime_error("Enter a valid speaker IP address");
+                    network_connect(c->ssid,c->password); if(storage_ok) save_settings(*c); seed=c->seed;
+                    refresh(); next_thumbnail=0; thumbnail_retries.clear();
+                    ui_toast("Connected"); ui_show(View::NowPlaying);
+                } else if(a=="Refresh") { refresh(); next_thumbnail=0; thumbnail_retries.clear(); }
+                else if(a=="Favorite") client.play_favorite(c->room,c->favorite);
+                else if(a=="Volume") client.volume(c->room,c->value);
+                else if(a=="GroupVolume") client.volume(c->room,c->value,true);
+                else if(a=="Mute") client.mute(c->room,c->value);
+                else if(a=="GroupMute") client.mute(c->room,c->value,true);
+                else if(a=="SaveArea") save_area(*c);
+                else if(a=="Area" || a=="Group") {
+                    client.apply_area(seed,c->area_ids);
+                    ui_rooms(client.rooms(seed)); ui_select(c->area_ids.front());
+                    if(a=="Area") ui_toast(c->name+" is grouped");
+                    last_rooms=0;
                 }
-                else if(c->action=="Mute") client.mute(c->room,c->value);
-                else if(c->action=="Join") {client.join(c->room,c->destination); refresh();}
-                else if(c->action=="Ungroup") {client.ungroup(c->room); refresh();}
-                else if(c->action=="Wake") client.invalidate_topology();
-                else if(c->action=="Event") { event_pending=false; if(topology_event.exchange(false)) client.invalidate_topology(); }
-                else if(c->action=="Queue") queue_track=-1;
-                else if(c->action=="QueueTrack") { client.play_queue_track(c->room,c->value); queue_track=-1; }
-                else if(c->action!="Poll") client.transport(c->room,c->action);
+                else if(a=="Wake") client.invalidate_topology();
+                else if(a=="Event") { event_pending=false; if(topology_event.exchange(false)) { client.invalidate_topology(); last_rooms=0; } }
+                else if(a=="Queue") queue_track=-1;
+                else if(a=="QueueTrack") { client.play_queue_track(c->room,c->value); queue_track=-1; }
+                else if(a!="Poll") client.transport(c->room,a);
             }
             if(!last_battery || xTaskGetTickCount()-last_battery>pdMS_TO_TICKS(30000)) {
                 last_battery=xTaskGetTickCount();
                 const auto battery=battery_read();
-                render_battery(battery);
+                ui_battery(battery);
                 ESP_LOGI(TAG,"Battery: %s %d mV %d%% %d mA%s",battery.present?"present":"absent",battery.pack_mv,
                          battery.percent,battery.current_ma,battery.charging?" charging":"");
             }
@@ -520,12 +232,28 @@ void worker(void*) {
             if(xTaskGetTickCount()-last_topology>pdMS_TO_TICKS(30000)) {
                 client.invalidate_topology(); last_topology=xTaskGetTickCount();
             }
+            if(!c && xTaskGetTickCount()<next_poll) {
+                if(thumbnails_pending) {
+                    const bool retry=next_thumbnail>=favorites.size();
+                    const size_t index=retry?thumbnail_retries.back():next_thumbnail++;
+                    if(retry) thumbnail_retries.pop_back();
+                    const auto& f=favorites[index];
+                    Artwork art;
+                    if(!f.art.empty()) try { art=fetch_artwork(seed,thumbnail_url(f.art),198); }
+                    catch(const std::exception& e) {
+                        ESP_LOGW(TAG,"Favorite art for %s: %s",f.title.c_str(),e.what());
+                        if(!retry) thumbnail_retries.push_back(index);
+                    }
+                    if(art.pixels) ui_favorite_art(f.id,std::move(art));
+                }
+                continue;
+            }
+            next_poll=xTaskGetTickCount()+pdMS_TO_TICKS(events_live?15000:4000);
             if(screen_off() && (!c || c->action=="Event")) continue; // nobody is looking; save the speakers the traffic
-            sonos::Room target;
-            {DisplayLock lock; target=selected;}
+            const auto target=ui_selected();
             if(target.id.empty()) continue;
             const auto state=client.state(target);
-            render_state(target,state);
+            ui_state(target,state);
             const auto leader=client.coordinator(target);
             std::vector<EventTarget> targets{{leader.ip,"AVTransport"},{target.ip,"RenderingControl"},
                                              {leader.ip,"GroupRenderingControl"},{leader.ip,"ZoneGroupTopology"}};
@@ -533,27 +261,56 @@ void worker(void*) {
             if(state.art!=art_uri || target.id!=art_room) {
                 art_uri=state.art; art_room=target.id;
                 Artwork art;
-                if(!state.art.empty()) try { art=fetch_artwork(target.ip,state.art,400); }
+                if(!state.art.empty()) try { art=fetch_artwork(target.ip,state.art,480); }
                 catch(const std::exception& e) { ESP_LOGW(TAG,"Artwork unavailable: %s",e.what()); }
-                render_artwork(target,std::move(art));
+                ui_artwork(target,std::move(art));
             }
-            bool queue_visible; {DisplayLock lock; queue_visible=lv_tabview_get_tab_active(tabs)==2;}
-            if(queue_visible && (state.track!=queue_track || target.id!=queue_room)) {
+            const auto view=ui_view();
+            if(view==View::Queue && (state.track!=queue_track || target.id!=queue_room)) {
                 // Show a window from just before the current track onwards.
                 int total=0; const int start=std::max(0,state.track-3);
                 auto items=client.queue(target,start,50,&total);
-                render_queue(target,items,total,state.track);
+                ui_queue(target,items,total,state.track);
                 queue_track=state.track; queue_room=target.id;
+            }
+            if(view==View::Rooms && (c || !last_rooms || xTaskGetTickCount()-last_rooms>pdMS_TO_TICKS(15000))) {
+                // Room cards show what every group is playing: fresh topology,
+                // then two calls per group coordinator.
+                last_rooms=xTaskGetTickCount();
+                auto all=client.rooms(seed);
+                ui_rooms(all);
+                std::vector<std::pair<std::string,sonos::Summary>> summaries;
+                for(const auto& r:all) if(r.id==r.coordinator) {
+                    try { summaries.emplace_back(r.id,client.summary(r)); }
+                    catch(const std::exception& e) { ESP_LOGW(TAG,"Summary for %s: %s",r.name.c_str(),e.what()); }
+                }
+                ui_summaries(summaries);
             }
         } catch(const std::exception& e) {
             // Drop queued actions after any failure; never replay a possibly completed queue mutation.
             Command* pending=nullptr;
             while(xQueueReceive(commands,&pending,0)==pdTRUE) delete pending;
+            event_pending=false;
             client.invalidate_topology();
-            status(e.what()); ESP_LOGE(TAG,"Controller operation failed: %s",e.what());
+            ui_toast(e.what(),true); ESP_LOGE(TAG,"Controller operation failed: %s",e.what());
         }
     }
 }
+}
+bool submit(Command* command) {
+    if(commands && xQueueSend(commands,&command,0)==pdTRUE) return true;
+    delete command;
+    return false;
+}
+std::string setting(const char* key) {
+    nvs_handle_t handle;
+    if(nvs_open("controller",NVS_READONLY,&handle)!=ESP_OK) return "";
+    size_t len=0; std::string value;
+    if(nvs_get_str(handle,key,nullptr,&len)==ESP_OK && len<=4096) {
+        value.resize(len); nvs_get_str(handle,key,value.data(),&len);
+        if(!value.empty()) value.pop_back();
+    }
+    nvs_close(handle); return value;
 }
 #ifdef CONFIG_TAB5_I2C_SCAN
 // Diagnostic only: enumerate the BSP I2C bus so the panel revision can be
@@ -685,11 +442,10 @@ extern "C" void app_main() {
     bsp_display_backlight_on();
     commands=xQueueCreate(8,sizeof(Command*));
     if(!commands) return;
-    {
-        DisplayLock lock;
-        lv_display_set_rotation(display,LV_DISPLAY_ROTATION_90);
-        build_ui();
-        screen_init(screen_woke);
-    }
-    if(xTaskCreate(worker,"sonos",24576,nullptr,4,nullptr)!=pdPASS) status("Unable to start controller task");
+    bsp_display_lock(0);
+    lv_display_set_rotation(display,LV_DISPLAY_ROTATION_90);
+    ui_build();
+    screen_init(screen_woke);
+    bsp_display_unlock();
+    if(xTaskCreate(worker,"sonos",24576,nullptr,4,nullptr)!=pdPASS) ui_toast("Unable to start the controller task",true);
 }

@@ -1,4 +1,5 @@
 #include "debug.hpp"
+#include "ui.hpp"
 #include "bsp/esp-bsp.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -6,6 +7,7 @@
 #include <algorithm>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include "esp_heap_caps.h"
 #include <string>
@@ -78,12 +80,25 @@ esp_err_t tasks(httpd_req_t* request) {
     httpd_resp_set_type(request,"text/plain");
     return httpd_resp_send(request,text.data(),text.size());
 }
+
+// Switches the visible view so every screen can be captured remotely.
+esp_err_t show(httpd_req_t* request) {
+    char query[32]{}, value[8]{};
+    if(httpd_req_get_url_query_str(request,query,sizeof query)!=ESP_OK || httpd_query_key_value(query,"view",value,sizeof value)!=ESP_OK)
+        return httpd_resp_send_err(request,HTTPD_400_BAD_REQUEST,"use /ui?view=0..4");
+    const int n=atoi(value);
+    if(n<0 || n>4) return httpd_resp_send_err(request,HTTPD_400_BAD_REQUEST,"view must be 0..4");
+    ui_show(static_cast<View>(n));
+    return httpd_resp_sendstr(request,"ok");
+}
 }
 
 void debug_register(httpd_handle_t server) {
     static const httpd_uri_t shot{.uri="/screenshot",.method=HTTP_GET,.handler=screenshot,.user_ctx=nullptr};
     static const httpd_uri_t list{.uri="/tasks",.method=HTTP_GET,.handler=tasks,.user_ctx=nullptr};
     static const httpd_uri_t log{.uri="/log",.method=HTTP_GET,.handler=log_dump,.user_ctx=nullptr};
+    static const httpd_uri_t ui{.uri="/ui",.method=HTTP_GET,.handler=show,.user_ctx=nullptr};
+    httpd_register_uri_handler(server,&ui);
     httpd_register_uri_handler(server,&shot);
     httpd_register_uri_handler(server,&list);
     httpd_register_uri_handler(server,&log);

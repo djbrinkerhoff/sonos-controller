@@ -20,8 +20,12 @@ struct State {
     int volume = 0;
     int group_volume = 0;
     int track = 0;
-    bool muted = false;
+    int position = -1, duration = -1;  // seconds; -1 when unknown (e.g. radio)
+    bool muted = false, group_muted = false;
 };
+// What a group is playing, for room overviews: two calls instead of state()'s six.
+struct Summary { std::string title, artist, playback; };
+int parse_clock(const std::string& hms);  // "H:MM:SS" -> seconds, -1 if not a time
 std::string escape(const std::string& value);
 Fields parse_response(const std::string& xml);
 std::vector<Room> parse_rooms(const std::string& xml);
@@ -39,11 +43,12 @@ public:
     // start is a 0-based queue index; items are numbered from start + 1.
     std::vector<QueueItem> queue(const Room& room, int start, int count, int* total = nullptr);
     State state(const Room& room);
+    Summary summary(const Room& coordinator);
     void play_favorite(const Room& room, const Favorite& favorite);
     void play_queue_track(const Room& room, int number);
     void transport(const Room& room, const std::string& action);
     void volume(const Room& room, int value, bool group = false);
-    void mute(const Room& room, bool value);
+    void mute(const Room& room, bool value, bool group = false);
     void join(const Room& room, const Room& destination);
     void ungroup(const Room& room);
     void apply_area(const std::string& seed, const std::vector<std::string>& room_ids);
