@@ -64,6 +64,19 @@ The BSP auto-detects the supported display variants. Wi-Fi uses the internal C6 
 
 Build success alone does not verify board initialization or playback. No physical device has been flashed during initial development.
 
+## Over-the-air updates
+
+The firmware now uses an OTA partition layout (`ota_0`/`ota_1` plus `otadata`) with signed app images and automatic rollback. Signing is software-only (`CONFIG_SECURE_SIGNED_APPS_NO_SECURE_BOOT`, RSA-3072); hardware secure boot and flash encryption stay off and no eFuses are burned.
+
+```sh
+bash tools/ota_key.sh          # generates firmware/keys/ota_signing_key.pem once; never overwrites
+bash tools/ota.sh <tab5-ip>    # builds, then POSTs the signed image to http://<tab5-ip>:3400/ota
+```
+
+The device must be flashed over USB **once** with a build that contains the new partition table and the rollback-aware bootloader; before that first flash `tools/ota.sh` has no endpoint to talk to. `esp_ota_end` verifies the signature on the device, so an unsigned or wrongly signed upload is rejected, and an image that fails to call `ota_mark_healthy()` on its first boot is rolled back automatically.
+
+**Back up `firmware/keys/ota_signing_key.pem` somewhere safe.** It is gitignored; losing it means no new image can be signed and updates go back to USB.
+
 ## Layout
 
 - `firmware/components/sonos/`: transport-independent C++ Sonos client and TinyXML2 parser.

@@ -1,5 +1,10 @@
 # Name, Type, SubType, Offset, Size
+# nvs/phy_init offsets are fixed so saved settings survive; human_face_det and
+# storage hold factory data and must never move or shrink.
 nvs,data,nvs,0x9000,0x6000
 phy_init,data,phy,0xf000,0x1000
-factory,app,factory,0x10000,0x700000
-# Prototype layout. Production OTA/rollback layout follows before appliance release.
+otadata,data,ota,0x10000,0x2000
+ota_0,app,ota_0,0x20000,0x4F0000
+ota_1,app,ota_1,0x510000,0x4F0000
+human_face_det,data,spiffs,0xA10000,0x64000
+storage,data,spiffs,0xA74000,0x200000
