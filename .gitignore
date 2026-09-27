@@ -11,6 +11,7 @@ firmware/sdkconfig.ssdp.local*
 firmware/managed_components/
 firmware/sdkconfig
 firmware/sdkconfig.old
+firmware/keys/
 __pycache__/
 *.pyc
 .DS_Store
