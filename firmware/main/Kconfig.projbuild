@@ -12,4 +12,13 @@ config TAB5_I2C_SCAN
         When enabled the device never starts the LVGL UI, so nothing appears
         on screen and the serial log is the only output.
 
+config TAB5_FORGET_SPEAKERS
+    bool "Forget stored speaker addresses at every boot"
+    default n
+    help
+        Erases the manual speaker IP and the saved room IPs on each boot,
+        so the controller must find a speaker through SSDP discovery.
+        Wi-Fi credentials and saved areas are kept. Used to test discovery
+        on hardware; flash the normal build afterwards.
+
 endmenu

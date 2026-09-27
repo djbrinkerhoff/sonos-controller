@@ -333,7 +333,9 @@ void refresh() {
         try { found=client.rooms(ip); seed=ip; break; }
         catch(const std::exception& e) { ESP_LOGW(TAG,"Speaker %s unusable: %s",ip.c_str(),e.what()); }
     }
-    if(found.empty()) { seed=discover_speaker(); found=client.rooms(seed); }
+    const bool discovered=found.empty();
+    if(discovered) { seed=discover_speaker(); found=client.rooms(seed); }
+    ESP_LOGI(TAG,"Using speaker %s (%s), %u rooms",seed.c_str(),discovered?"discovered":"stored",static_cast<unsigned>(found.size()));
     save_known_speakers(found);
     auto f=client.favorites(seed);
     render_catalog(std::move(found),std::move(f));
@@ -501,6 +503,17 @@ extern "C" void app_main() {
     // persistence instead, so the device does not look bricked.
     auto nvs=nvs_flash_init();
     if(nvs!=ESP_OK) { ESP_LOGE(TAG,"NVS init failed: %s (settings preserved)",esp_err_to_name(nvs)); storage_ok=false; }
+#ifdef CONFIG_TAB5_FORGET_SPEAKERS
+    // Diagnostic only: drop stored speaker addresses so every boot has to
+    // find a speaker through discovery. Wi-Fi credentials are kept.
+    if(nvs_handle_t handle; storage_ok && nvs_open("controller",NVS_READWRITE,&handle)==ESP_OK) {
+        for(const char* key:{"seed","speakers"}) {
+            auto erased=nvs_erase_key(handle,key);
+            ESP_LOGW(TAG,"Forget speakers: %s -> %s",key,esp_err_to_name(erased));
+        }
+        nvs_commit(handle); nvs_close(handle);
+    }
+#endif
 #ifdef CONFIG_TAB5_I2C_SCAN
     i2c_scan_diagnostic();
     return;

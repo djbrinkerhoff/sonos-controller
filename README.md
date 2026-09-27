@@ -13,7 +13,8 @@ Implemented:
 - Favorites screen restricted to Apple Music and Sonos Radio using service IDs supplied by the household; unknown/conflicting providers are excluded.
 - Room selection, now-playing text, play/pause/stop, capability-gated previous/next, room mute, room and group volume.
 - Group/ungroup rooms and up to eight saved areas. Group the desired rooms, name the current group, and save it; apply a saved area to restore its membership.
-- On-device Wi-Fi setup, manual speaker IP fallback, persistent settings and areas.
+- Speaker discovery by SSDP and mDNS together, remembered room IPs as a fallback, and an optional manual speaker IP.
+- On-device Wi-Fi setup, persistent settings and areas.
 - Network work on a separate FreeRTOS task, bounded XML responses and paginated favorites, periodic state refresh, fresh coordinator lookup before group playback actions.
 - Favorite playback replaces the queue (like the official app's "Replace Queue") and starts it. Radio favorites use their supplied stream URI/metadata. A failed operation is not automatically replayed.
 - Read-only Python compatibility probe and host tests for the shared C++ Sonos protocol code.

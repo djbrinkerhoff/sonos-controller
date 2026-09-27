@@ -2,6 +2,30 @@
 
 Updated September 26, 2026 (second pass, same day). The device is now flashed, booting, on Wi-Fi, and talking to the real household speakers. The board bring-up blockers are resolved; the unproven product milestone is now audible playback.
 
+## Session 4: discovery fixed
+
+**Finding.** With the stored addresses erased, the session 3 SSDP code found a speaker on only 3 of 6 cold boots. When it failed, *no* speaker answered any of the three searches, even 24 s later on a retry, so the listen window was not the cause. From the Mac, multicast SSDP gets all 5 speakers every time; subnet-broadcast M-SEARCH gets none (Sonos ignores it). The gateway `192.168.68.1` on a /22 suggests a TP-Link Deco mesh. The likely cause is IGMP-snooping or multicast forwarding on the mesh dropping the Tab5's `239.255.255.250` traffic on some associations. That is a hypothesis, not proven.
+
+**Fix.** `discover_speaker()` now sends an mDNS query for `_sonos._tcp.local` to `224.0.0.251` alongside each SSDP search, from the same ephemeral-port socket. `224.0.0.x` is link-local and flooded rather than snooped. A query from a port other than 5353 is a "legacy unicast" mDNS query, so speakers reply directly and the reply's source address is the speaker. There is no new dependency and no DNS record parsing. The first valid answer from either method wins. It runs 5 rounds over 6 s. The log line says which method answered.
+
+**Hardware evidence** (diagnostic build, stored addresses erased every boot):
+
+- 18 of 18 cold boots found a speaker with SSDP + mDNS.
+- One boot was a "bad" boot: SSDP got zero replies over 3 rounds while mDNS reached all 5 speakers (on its third round, which is why the window grew to 5 rounds).
+- On every other boot both methods heard all 5 speakers; mDNS answered in 8–23 ms.
+- SSDP alone: 3 of 6 in the first batch, 17 of 18 afterwards. Why it varied is unknown.
+- Batch 3 (10 boots, final code) had no bad boot, so the widened window's rescue path has not been exercised on the final code.
+
+**State of the device.** The normal build is flashed. The diagnostic erased the old manual `seed`, as planned; `speakers` holds all 5 room IPs, and a normal boot logs `Using speaker ... (stored), 5 rooms`. Refresh now logs the speaker it used and whether it came from storage or discovery.
+
+**Diagnostic build.** `CONFIG_TAB5_FORGET_SPEAKERS` (`firmware/sdkconfig.ssdp`) erases `seed` and `speakers` at every boot, keeps Wi-Fi credentials and areas, and makes discovery listen for the whole window and log which speakers answered each method:
+
+```sh
+bash tools/idf.sh -B build-ssdp -D SDKCONFIG=sdkconfig.ssdp.local -D 'SDKCONFIG_DEFAULTS=sdkconfig.defaults;sdkconfig.ssdp' build
+```
+
+Flash the normal build afterwards; the diagnostic erases the stored addresses on every boot.
+
 ## Session 3: review fixes
 
 Code review changes, committed as `6718ff7` and flashed to the Tab5 (P4 v1.3, default build):
@@ -22,7 +46,7 @@ Hardware results after flashing:
 - The `speakers` NVS key was written with all 5 room IPs (checked by reading the NVS partition; the dump was deleted because it also holds the Wi-Fi password).
 - **Passed (user-confirmed):** rooms and favorites load, favorite playback replaces the queue, and the Sonos Radio favorite ("Set The Table") plays.
 - **Not tested, by user choice for now:** group volume, grouping, saved areas, and Wi-Fi recovery after a router restart.
-- **Not tested:** SSDP discovery. With a working seed and 5 saved IPs it is never reached; testing it means erasing the `seed` and `speakers` keys, which needs the user's approval.
+- SSDP discovery: tested in session 4 (above).
 
 ## Session 2: hardware bring-up (what changed)
 
@@ -71,8 +95,7 @@ Restoring the vendor defaults fixed it completely. This would have been misdiagn
 
 ## Open items
 
-- **SSDP discovery was unreliable.** Session 3 changed the listen window and power save and added a saved-IP fallback; hardware confirmation is pending.
-- The seeded `seed` IP is still present in device NVS and should be cleared once discovery is fixed.
+- **Discovery** is fixed by adding mDNS (session 4): 18 of 18 cold boots with no stored address. Keep an eye on it across more days and access-point changes; the SSDP failure's root cause on the mesh is unconfirmed.
 - SOAP `timeout_ms` is 5 s per network operation (session 3); confirm on hardware that large favorites/topology replies stay comfortably inside it.
 - Artwork is parsed but not rendered. Queue browser/editing, battery/charging, dim/sleep/wake, OTA signing/rollback, and soak testing remain.
 - Wi-Fi credentials live in ordinary NVS. Production credential protection remains.
@@ -102,7 +125,7 @@ Important files:
 - `README.md`: build/use instructions and explicit prototype limitations.
 - `PLAN.md`: chosen architecture plus future alternatives.
 - `firmware/main/main.cpp`: LVGL Favorites / Now Playing / Rooms / Settings screens, NVS Wi-Fi and area storage, FreeRTOS worker and command queue.
-- `firmware/main/network.cpp`: Wi-Fi via C6, SSDP discovery and bounded SOAP HTTP transport.
+- `firmware/main/network.cpp`: Wi-Fi via C6, SSDP + mDNS discovery and bounded SOAP HTTP transport.
 - `firmware/components/sonos/sonos.cpp` and `include/sonos.hpp`: room topology, providers, favorites pagination, playback, room/group volume, mute, grouping and applying saved areas.
 - `firmware/components/sonos/vendor/`: TinyXML2 10.0.0, with upstream license.
 - `firmware/main/idf_component.yml`, `firmware/dependencies.lock`: pinned components.
@@ -179,7 +202,7 @@ Build log: `artifacts/firmware-build.log`. Some local incremental builds can run
 
 1. Read this handoff. Inspect current files before changing anything; agents share this directory.
 2. **Finish the playback validation matrix.** Apple Music favorites are proven; Sonos Radio and replace-queue passed in session 3; still untested are room/group volume, grouping/ungrouping, saved areas, queue viewing, and whether external changes made in the official app are reflected. Test every speaker model actually present, not just the one used so far.
-3. **Confirm SSDP auto-discovery on hardware** after the session 3 changes. It was intermittent. Playback currently depends on a seeded manual IP, so the product does not yet work from a cold boot with no stored address; that address also goes stale if the router reassigns it. Clear the `seed` key from NVS once discovery is reliable.
+3. Discovery is done (session 4). Still untested from session 3: Wi-Fi recovery after an access-point restart.
 4. Fix any board/protocol issues observed before expanding UI/features. Then finish the appliance work listed above.
 
 Commands from project root:
@@ -219,7 +242,7 @@ Verified results: the legacy-P4 firmware build, 40 passing native assertions, 9 
 
 That last item is the significant one. `PLAN.md` selected the favorites-first standalone architecture on the condition that Apple Music playback could be proven, and warned against assuming any Apple Music item is directly playable by Sonos. It is proven for favorites. The saved private report contains 17 `allowed_favorites`.
 
-Still unproven: grouping, saved areas, queue viewing, reflection of external changes, and every speaker model in the household. Also note all playback so far was driven by a **seeded manual IP**; SSDP discovery remains unreliable, so the product does not yet work from a cold boot with no stored address.
+Still unproven: grouping, saved areas, queue viewing, reflection of external changes, and every speaker model in the household. Session 4 made the controller find speakers from a cold boot with no stored address (SSDP + mDNS, 18 of 18 boots).
 
 A backup of the device's original flash exists at `artifacts/tab5-original.bin` and should be preserved. To return the Tab5 to factory firmware, write that image back and reset.
 

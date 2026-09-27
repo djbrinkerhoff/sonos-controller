@@ -163,37 +163,75 @@ std::string discover_speaker() {
     struct Cleanup { int fd; ~Cleanup(){close(fd);} } cleanup{fd};
     timeval timeout{0,250000};
     setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&timeout,sizeof(timeout));
-    sockaddr_in address{};
-    address.sin_family=AF_INET; address.sin_port=htons(1900);
-    inet_pton(AF_INET,"239.255.255.250",&address.sin_addr);
-    const std::string request="M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 2\r\nST: urn:schemas-upnp-org:device:ZonePlayer:1\r\n\r\n";
-    // Speakers answer after a random delay of up to MX seconds, so listen
-    // against one overall deadline and resend in case a datagram was lost,
-    // instead of giving up at the first quiet interval.
+    sockaddr_in ssdp{}, mdns{};
+    ssdp.sin_family=AF_INET; ssdp.sin_port=htons(1900);
+    inet_pton(AF_INET,"239.255.255.250",&ssdp.sin_addr);
+    mdns.sin_family=AF_INET; mdns.sin_port=htons(5353);
+    inet_pton(AF_INET,"224.0.0.251",&mdns.sin_addr);
+    const std::string search="M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 2\r\nST: urn:schemas-upnp-org:device:ZonePlayer:1\r\n\r\n";
+    // SSDP's 239.255.255.250 is subject to IGMP snooping, which on this
+    // household's mesh intermittently drops the search outright. mDNS uses
+    // link-local 224.0.0.251, which switches flood, so ask both at once. Sent
+    // from an ephemeral port this is a "legacy unicast" mDNS query: speakers
+    // reply directly to us, and the reply's source address is the speaker.
+    static const unsigned char query[]={0x50,0x4F, 0,0, 0,1, 0,0, 0,0, 0,0,
+        6,'_','s','o','n','o','s', 4,'_','t','c','p', 5,'l','o','c','a','l', 0, 0,12, 0,1};
+    // Speakers answer SSDP after a random delay of up to MX seconds, so listen
+    // against one overall deadline and resend in case a datagram was lost. On
+    // hardware, a bad boot has needed the third round before mDNS got through.
     const int64_t start=esp_timer_get_time();
-    const int64_t deadline=start+4000000;
+    const int64_t deadline=start+6000000;
     int64_t next_send=start;
     int sent=0;
+#ifdef CONFIG_TAB5_FORGET_SPEAKERS
+    // Diagnostic build: listen for the whole window and compare both methods.
+    std::string first, answered[2];
+#endif
     while(esp_timer_get_time()<deadline) {
-        if(sent<3 && esp_timer_get_time()>=next_send) {
-            sendto(fd,request.data(),request.size(),0,reinterpret_cast<sockaddr*>(&address),sizeof(address));
+        if(sent<5 && esp_timer_get_time()>=next_send) {
+            sendto(fd,search.data(),search.size(),0,reinterpret_cast<sockaddr*>(&ssdp),sizeof(ssdp));
+            sendto(fd,query,sizeof(query),0,reinterpret_cast<sockaddr*>(&mdns),sizeof(mdns));
             ++sent; next_send+=1000000;
         }
         char data[4096];
-        int n=recv(fd,data,sizeof(data)-1,0);
+        sockaddr_in from{}; socklen_t from_len=sizeof(from);
+        int n=recvfrom(fd,data,sizeof(data)-1,0,reinterpret_cast<sockaddr*>(&from),&from_len);
         if(n<=0) continue;
-        std::string response(data,n), lower=response;
-        std::transform(lower.begin(),lower.end(),lower.begin(),[](unsigned char c){return std::tolower(c);});
-        if(lower.find("zoneplayer")==std::string::npos) continue;
-        auto begin=lower.find("\r\nlocation:");
-        if(begin==std::string::npos) continue;
-        begin+=11;
-        while(begin<response.size() && response[begin]==' ') ++begin;
-        auto ip=sonos::ipv4_from_url(response.substr(begin,response.find("\r\n",begin)-begin));
-        if(!ip.empty()) {
-            ESP_LOGI(TAG,"ssdp: found %s after %lld ms, %d request(s)",ip.c_str(),(esp_timer_get_time()-start)/1000,sent);
-            return ip;
+        std::string response(data,n), ip, method;
+        if(ntohs(from.sin_port)==5353) {
+            // Our query ID echoed, QR (response) bit set, and about _sonos.
+            if(n<12 || data[0]!=0x50 || data[1]!=0x4F || !(data[2]&0x80) || response.find("_sonos")==std::string::npos) continue;
+            char text[INET_ADDRSTRLEN]{};
+            inet_ntop(AF_INET,&from.sin_addr,text,sizeof(text));
+            if(sonos::valid_ipv4(text)) { ip=text; method="mdns"; }
+        } else {
+            std::string lower=response;
+            std::transform(lower.begin(),lower.end(),lower.begin(),[](unsigned char c){return std::tolower(c);});
+            if(lower.find("zoneplayer")==std::string::npos) continue;
+            auto begin=lower.find("\r\nlocation:");
+            if(begin==std::string::npos) continue;
+            begin+=11;
+            while(begin<response.size() && response[begin]==' ') ++begin;
+            ip=sonos::ipv4_from_url(response.substr(begin,response.find("\r\n",begin)-begin));
+            method="ssdp";
         }
+        if(ip.empty()) continue;
+#ifdef CONFIG_TAB5_FORGET_SPEAKERS
+        auto& seen=answered[method=="mdns"];
+        auto octet=" "+ip.substr(ip.rfind('.')+1);
+        if((seen+" ").find(octet+" ")==std::string::npos) seen+=octet;
+        if(!first.empty()) continue;
+        first=ip;
+#endif
+        ESP_LOGI(TAG,"discovery: %s found %s after %lld ms, %d round(s)",method.c_str(),ip.c_str(),(esp_timer_get_time()-start)/1000,sent);
+#ifndef CONFIG_TAB5_FORGET_SPEAKERS
+        return ip;
+#endif
     }
+#ifdef CONFIG_TAB5_FORGET_SPEAKERS
+    ESP_LOGI(TAG,"discovery: replies over %d round(s) - ssdp:[%s ] mdns:[%s ]",sent,answered[0].c_str(),answered[1].c_str());
+    if(!first.empty()) return first;
+#endif
+    ESP_LOGW(TAG,"discovery: no SSDP or mDNS reply after %d round(s)",sent);
     throw std::runtime_error("No Sonos speaker found. Enter a speaker IP in Settings.");
 }
