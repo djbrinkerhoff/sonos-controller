@@ -215,6 +215,7 @@ Restoring the vendor defaults fixed it completely. This would have been misdiagn
 
 ## Open items
 
+- **TODO: persistent cover cache in internal flash.** Favorite covers are downloaded and resized again after every boot, so tiles fill in one by one. Instead, save the prepared 196 px tiles (about 77 KB each in RGB565, about 1.2 MB for 16) in a new data partition in the free flash above 0xC74000 (about 3.5 MB), keyed by art URL, and fetch only on a miss. Do not move or shrink `nvs`, `human_face_det` or `storage`. The new partition table needs one USB flash, not OTA. No SD card is needed: this is about startup, not scroll speed, which is bound by PSRAM reads.
 - **Discovery** is fixed by adding mDNS (session 4): 18 of 18 cold boots with no stored address. Keep an eye on it across more days and access-point changes; the SSDP failure's root cause on the mesh is unconfirmed.
 - SOAP `timeout_ms` is 5 s per network operation (session 3); confirm on hardware that large favorites/topology replies stay comfortably inside it.
 - Session 5 added artwork, the queue view, battery, dim/sleep/wake and signed OTA. Queue editing and soak testing remain.
