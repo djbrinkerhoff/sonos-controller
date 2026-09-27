@@ -158,7 +158,23 @@ lv_obj_t *np_title,*np_artist,*np_album,*np_progress,*np_elapsed,*np_remaining,*
 lv_obj_t *np_prev,*np_play,*np_next,*np_mute,*np_volume,*np_volume_value,*np_volume_caption,*np_empty_hint;
 // Favorites
 lv_obj_t* fav_grid;
-struct Tile { ArtFrame art; };
+// Each favorite tile is one pre-composed image: cover (or placeholder), title
+// and radio badge drawn once onto a canvas. As separate widgets (card, frame,
+// image, title, badge) the ~90 objects cost ~13 ms per scroll frame in tree
+// walks and per-object draw events, plus time moving them on every scroll step.
+constexpr int32_t TILE_W=art_spec::tile_side, TILE_TITLE_Y=art_spec::tile_side+8, TILE_H=TILE_TITLE_Y+72;
+// The grid's column gap (applied as the view's pad_column). An even stride keeps
+// each tile's destination offset 4-byte aligned, and five columns must fit.
+constexpr int32_t FAV_COLUMNS=5, FAV_GAP=22;
+static_assert((TILE_W+FAV_GAP)%2==0 && PAD%2==0,"tile x positions must stay even");
+static_assert(FAV_COLUMNS*TILE_W+(FAV_COLUMNS-1)*FAV_GAP<=CONTENT_W-2*PAD,"five favorite tiles must fit a row");
+struct Tile {
+    lv_obj_t* canvas=nullptr;
+    lv_draw_buf_t* pixels=nullptr;
+    std::string title;  // wrapped and "..."-truncated by a label once
+    bool radio=false;
+    ~Tile() { if(pixels) lv_draw_buf_destroy(pixels); }
+};
 std::map<std::string,Tile> tiles;  // node-stable, so the image descriptors stay put
 // Queue, Rooms, Settings
 lv_obj_t *queue_list,*queue_header;
@@ -319,40 +335,80 @@ void favorite_clicked(lv_event_t* e) {
     ui_toast("Starting "+favorites[index].title+" in "+selected.name);
     show_view(View::NowPlaying);
 }
+// Paints a tile: cover pixels when given, otherwise the placeholder.
+void compose_tile(Tile& t,const Artwork* art) {
+    lv_canvas_fill_bg(t.canvas,c(ink::bg),LV_OPA_COVER);
+    lv_layer_t layer; lv_canvas_init_layer(t.canvas,&layer);
+    const lv_area_t cover{0,0,TILE_W-1,TILE_W-1};
+    lv_image_dsc_t dsc{};
+    if(art && art->pixels) {
+        dsc.header.magic=LV_IMAGE_HEADER_MAGIC; dsc.header.cf=LV_COLOR_FORMAT_RGB565;
+        dsc.header.w=art->width; dsc.header.h=art->height; dsc.header.stride=art->stride;
+        dsc.data_size=art->stride*art->height; dsc.data=art->pixels;
+        lv_draw_image_dsc_t image; lv_draw_image_dsc_init(&image); image.src=&dsc;
+        lv_draw_image(&layer,&image,&cover);
+    } else {
+        lv_draw_rect_dsc_t box; lv_draw_rect_dsc_init(&box);
+        box.bg_color=c(ink::raised); box.radius=art_spec::tile_radius;
+        lv_draw_rect(&layer,&box,&cover);
+        lv_draw_label_dsc_t icon; lv_draw_label_dsc_init(&icon);
+        icon.font=&font_body_32; icon.color=c(ink::faint); icon.align=LV_TEXT_ALIGN_CENTER;
+        icon.text=t.radio?ICON_RADIO:LV_SYMBOL_AUDIO;
+        const lv_area_t middle{0,TILE_W/2-20,TILE_W-1,TILE_W/2+20};
+        lv_draw_label(&layer,&icon,&middle);
+    }
+    if(t.radio) {  // nearly everything is Apple Music, so only radio is marked
+        const lv_area_t badge{TILE_W-62,10,TILE_W-11,61};
+        lv_draw_rect_dsc_t dot; lv_draw_rect_dsc_init(&dot);
+        dot.bg_color=c(ink::bg); dot.bg_opa=LV_OPA_80; dot.radius=LV_RADIUS_CIRCLE;
+        lv_draw_rect(&layer,&dot,&badge);
+        lv_draw_label_dsc_t icon; lv_draw_label_dsc_init(&icon);
+        icon.font=&font_caption_22; icon.color=c(ink::text); icon.align=LV_TEXT_ALIGN_CENTER; icon.text=ICON_RADIO;
+        const lv_area_t icon_area{badge.x1,badge.y1+13,badge.x2,badge.y2};
+        lv_draw_label(&layer,&icon,&icon_area);
+    }
+    lv_draw_label_dsc_t title; lv_draw_label_dsc_init(&title);
+    title.font=&font_body_26; title.color=c(ink::text); title.line_space=2; title.text=t.title.c_str();
+    const lv_area_t title_area{0,TILE_TITLE_Y,TILE_W-1,TILE_H-1};
+    lv_draw_label(&layer,&title,&title_area);
+    lv_canvas_finish_layer(t.canvas,&layer);
+}
 void render_favorites() {
-    lv_obj_clean(fav_grid); tiles.clear();
+    lv_obj_clean(fav_grid); tiles.clear();  // widgets first, then the pixels they showed
     if(favorites.empty()) {
         auto l=text(fav_grid,&font_body_26,ink::muted,"No Apple Music or Sonos Radio favorites yet.\nAdd some in the Sonos app; they appear here automatically.");
         lv_obj_set_width(l,CONTENT_W-2*PAD);
         return;
     }
-    constexpr int columns=5, gap=24, tile=art_spec::tile_side;
-    static_assert(columns*tile+(columns-1)*gap<=CONTENT_W-2*PAD,"favorite tiles must fit the grid");
+
+    // One label, reused, does the wrapping and "..." truncation for every title.
+    auto measure=text(fav_grid,&font_body_26,ink::text,"");
+    lv_obj_set_size(measure,TILE_W,72); lv_label_set_long_mode(measure,LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_line_space(measure,2,0); lv_obj_add_flag(measure,LV_OBJ_FLAG_IGNORE_LAYOUT);
     for(size_t i=0;i<favorites.size();++i) {
         const auto& f=favorites[i];
-        auto card=tappable(fav_grid,tile,LV_SIZE_CONTENT,ink::bg,ink::surface,20,favorite_clicked,reinterpret_cast<void*>(i));
-        lv_obj_set_style_bg_opa(card,LV_OPA_TRANSP,0);  // same colour as the view; only pressed needs a fill
-        lv_obj_set_style_bg_opa(card,LV_OPA_COVER,LV_STATE_PRESSED);
-        lv_obj_set_flex_flow(card,LV_FLEX_FLOW_COLUMN); lv_obj_set_style_pad_row(card,8,0); lv_obj_set_style_pad_bottom(card,8,0);
         auto& t=tiles[f.id+"#"+std::to_string(i)];
-        t.art.build(card,tile,art_spec::tile_radius,f.radio?ICON_RADIO:LV_SYMBOL_AUDIO);
-        // Two lines of title at a fixed height keep every row of tiles aligned.
-        auto title=text(card,&font_body_26,ink::text,f.title.c_str());
-        lv_obj_set_size(title,tile,72); lv_label_set_long_mode(title,LV_LABEL_LONG_DOT);
-        lv_obj_set_style_text_line_space(title,2,0);
-        if(f.radio) {  // nearly everything is Apple Music, so only radio is marked
-            auto badge=div(t.art.frame); lv_obj_set_size(badge,52,52); lv_obj_align(badge,LV_ALIGN_TOP_RIGHT,-10,10);
-            lv_obj_set_style_bg_opa(badge,LV_OPA_80,0); lv_obj_set_style_bg_color(badge,c(ink::bg),0);
-            lv_obj_set_style_radius(badge,LV_RADIUS_CIRCLE,0);
-            auto i=text(badge,&font_caption_22,ink::text,ICON_RADIO); lv_obj_center(i);
-        }
+        t.radio=f.radio;
+        lv_label_set_text(measure,f.title.c_str()); lv_obj_update_layout(measure);
+        t.title=lv_label_get_text(measure);
+        if(!(t.pixels=lv_draw_buf_create(TILE_W,TILE_H,LV_COLOR_FORMAT_RGB565,LV_STRIDE_AUTO))) continue;
+        t.canvas=lv_canvas_create(fav_grid); lv_canvas_set_draw_buf(t.canvas,t.pixels);
+        lv_obj_add_flag(t.canvas,LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_remove_flag(t.canvas,LV_OBJ_FLAG_SCROLL_ON_FOCUS);
+        lv_obj_add_event_cb(t.canvas,favorite_clicked,LV_EVENT_CLICKED,reinterpret_cast<void*>(i));
+        lv_obj_set_style_outline_color(t.canvas,c(ink::accent),LV_STATE_PRESSED);
+        lv_obj_set_style_outline_width(t.canvas,3,LV_STATE_PRESSED);
+        lv_obj_set_style_outline_pad(t.canvas,6,LV_STATE_PRESSED);
+        lv_obj_set_style_radius(t.canvas,art_spec::tile_radius,LV_STATE_PRESSED);
+        compose_tile(t,nullptr);
     }
+    lv_obj_delete(measure);
 }
 void build_favorites(lv_obj_t* v) {
     fav_grid=v;
     lv_obj_set_flex_flow(v,LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_style_pad_all(v,PAD,0); lv_obj_set_style_pad_top(v,24,0);
-    lv_obj_set_style_pad_column(v,24,0); lv_obj_set_style_pad_row(v,32,0);
+    lv_obj_set_style_pad_column(v,FAV_GAP,0); lv_obj_set_style_pad_row(v,32,0);
     text(v,&font_body_26,ink::muted,"Connect to Wi-Fi in Settings to find your Sonos system.");
 }
 
@@ -649,8 +705,8 @@ void ui_favorite_art(const std::string& id,Artwork art) {
     DisplayLock lock;
     for(size_t i=0;i<favorites.size();++i) if(favorites[i].id==id) {
         auto it=tiles.find(id+"#"+std::to_string(i));
-        if(it!=tiles.end()) it->second.art.set(std::move(art));
-        return;
+        if(it!=tiles.end() && it->second.canvas) { compose_tile(it->second,&art); lv_obj_invalidate(it->second.canvas); }
+        return;  // the cover pixels are now part of the tile; art is freed here
     }
 }
 void ui_state(const sonos::Room& room,const sonos::State& state) {

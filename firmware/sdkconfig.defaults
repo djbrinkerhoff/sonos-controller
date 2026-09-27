@@ -26,6 +26,9 @@ CONFIG_LV_USE_SYSMON=n
 CONFIG_LVGL_PORT_ENABLE_PPA=y
 # Frames now render in ~17-48 ms; a 33 ms refresh timer would cap them at 30 fps.
 CONFIG_LV_DEF_REFR_PERIOD=16
+# Covers and tiles stream out of PSRAM with a cold cache every frame; longer
+# lines mean fewer, longer PSRAM bursts.
+CONFIG_CACHE_L2_CACHE_LINE_128B=y
 # Internal DMA RAM is nearly all display buffers; TLS handshakes for artwork
 # failed at ~24 KB free, so mbedTLS allocates from PSRAM instead.
 CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y

@@ -235,6 +235,31 @@ esp_err_t profile(httpd_req_t* request) {
 }
 #endif
 
+// Copy throughput from PSRAM into internal RAM, as the renderer does for images:
+// aligned and 2-byte-misaligned rows, with LVGL's lv_memcpy and the C library.
+esp_err_t membench(httpd_req_t* request) {
+    constexpr size_t ROW=392, ROWS=196, SIZE=ROW*ROWS;
+    auto* src=static_cast<uint8_t*>(heap_caps_malloc(SIZE+8,MALLOC_CAP_SPIRAM));
+    auto* dst=static_cast<uint8_t*>(heap_caps_malloc(ROW+8,MALLOC_CAP_INTERNAL|MALLOC_CAP_DMA));
+    if(!src || !dst) { heap_caps_free(src); heap_caps_free(dst); return httpd_resp_send_err(request,HTTPD_500_INTERNAL_SERVER_ERROR,"no memory"); }
+    std::string out; char line[96];
+    for(int variant=0;variant<4;++variant) {
+        const bool misaligned=variant&1, clib=variant&2;
+        const size_t off=misaligned?2:0;
+        const int64_t start=esp_timer_get_time();
+        for(int pass=0;pass<10;++pass)
+            for(size_t r=0;r<ROWS;++r) {
+                if(clib) memcpy(dst+off,src+r*ROW,ROW); else lv_memcpy(dst+off,src+r*ROW,ROW);
+            }
+        const double us=esp_timer_get_time()-start;
+        snprintf(line,sizeof line,"%-8s %-10s %6.1f MB/s\n",clib?"libc":"lv",misaligned?"misaligned":"aligned",10.0*SIZE/us);
+        out+=line;
+    }
+    heap_caps_free(src); heap_caps_free(dst);
+    httpd_resp_set_type(request,"text/plain");
+    return httpd_resp_send(request,out.data(),out.size());
+}
+
 // Switches the visible view so every screen can be captured remotely.
 esp_err_t show(httpd_req_t* request) {
     char query[32]{}, value[8]{};
@@ -258,6 +283,8 @@ void debug_register(httpd_handle_t server) {
     static const httpd_uri_t panel_uri{.uri="/panel",.method=HTTP_GET,.handler=panel,.user_ctx=nullptr};
     httpd_register_uri_handler(server,&panel_uri);
     httpd_register_uri_handler(server,&drag_uri);
+    static const httpd_uri_t membench_uri{.uri="/membench",.method=HTTP_GET,.handler=membench,.user_ctx=nullptr};
+    httpd_register_uri_handler(server,&membench_uri);
 #if LV_USE_PROFILER && LV_USE_PROFILER_BUILTIN
     static const httpd_uri_t profile_uri{.uri="/profile",.method=HTTP_GET,.handler=profile,.user_ctx=nullptr};
     httpd_register_uri_handler(server,&profile_uri);

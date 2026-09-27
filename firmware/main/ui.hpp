@@ -13,7 +13,9 @@ enum class View { NowPlaying, Favorites, Queue, Rooms, Settings };
 // images in LVGL costs about a second per full-screen frame on this device.
 namespace art_spec {
 constexpr uint32_t now_side=480, now_radius=24;
-constexpr uint32_t tile_side=195, tile_radius=16;
+// 196 (not 195): a 392-byte row keeps every image row 4-byte aligned. LVGL's
+// copy loop falls back to byte-at-a-time copies on misaligned rows.
+constexpr uint32_t tile_side=196, tile_radius=16;
 constexpr uint32_t background=0x0F1216;  // the view background behind covers
 }
 

@@ -2,6 +2,24 @@
 
 Updated September 26, 2026 (second pass, same day). The device is now flashed, booting, on Wi-Fi, and talking to the real household speakers. The board bring-up blockers are resolved; the unproven product milestone is now audible playback.
 
+## Session 8: Favorites scrolling
+
+Favorites scrolling went from **~20 fps** (41 ms frames, 10.5 ms between frames) to **~32 fps** (26.9 ms frames, 3.1 ms between). Switching to the Favorites view went from 47 to 33 ms. Other views are unchanged (Playing 40, Queue 25, Settings 35, Rooms 33-37 ms).
+
+Measured with `/perf`, a scripted `/drag` down and back, and a layout-neutral ablation (hiding covers or titles without reflowing the grid). An earlier ablation was invalid: zsh does not word-split, so `set -- $combo` never worked, and the grid scrolled further on every run.
+
+**What worked:**
+- **Aligned image rows.** Tiles are 196 px (392-byte rows) at even x positions (`FAV_GAP=22`, static-asserted). LVGL's `lv_memcpy` copies through a byte-at-a-time `volatile` loop when source and destination alignments differ. `/membench` measured PSRAM to internal RAM at 311 MB/s aligned vs 145 MB/s misaligned (C library: 401 vs 70).
+- **One pre-composed canvas per tile:** cover or placeholder, title (wrapped and truncated by a reused label) and radio badge, composed once. Each tile had been 5-7 widgets, about 90 in total, which cost tree walks, draw events and child moves on every scroll step. Press feedback is now an amber outline.
+- **128-byte L2 cache line** (`CONFIG_CACHE_L2_CACHE_LINE_128B`). Tile pixels stream out of PSRAM with a cold cache every frame, so longer lines mean fewer bursts. This cut both frame time and the gap between frames. Checked with two OTA uploads during continuous scrolling and with `/panel`.
+
+**Measured and rejected:**
+- A custom PPA draw unit for image copies: slower. Bands slice every cover into ~30-row strips, so DMA setup and whole-row cache write-back cost more than the copy saves.
+- `CONFIG_LV_USE_CLIB_STRING`: no gain for Favorites, and Playing went from 40 to 55 ms because the C library is 6x slower on misaligned copies.
+- Titles via `lv_snapshot`: included the label's extended draw area as black bars.
+
+**Where the remaining ~27 ms goes:** reading about 1 MB of tile pixels from PSRAM per frame, plus rail and header. Queue scrolls at ~42 fps (19 ms frames).
+
 ## Session 7: UI performance
 
 The user reported that the Playing and Favorites views drew slowly, in a visible top-to-bottom wipe. Measured with new instrumentation:
