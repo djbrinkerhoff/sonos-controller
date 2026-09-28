@@ -202,7 +202,7 @@ void post_now_art(const sonos::Room& target,const std::string& uri) {
 }
 void post_tile_art(size_t index,const std::string& id,const std::string& uri) {
     if(!tile_jobs || uri.empty()) return;
-    auto job=new ArtJob; job->tile=index; job->fav_id=id; job->uri=uri; job->queued=esp_timer_get_time();
+    auto job=new ArtJob; job->tile=index; job->fav_id=id; job->uri=uri; job->ip=seed; job->queued=esp_timer_get_time();
     if(xQueueSend(tile_jobs,&job,0)!=pdTRUE) delete job;
 }
 void artwork_worker(void*) {

@@ -415,10 +415,14 @@ void update_tile_cache() {
     for(size_t i=0;i<tiles.size();++i) {
         auto& t=tiles[i];
         if(i>=lo && i<hi) {
-            if(t.pixels) continue;
-            if(!(t.pixels=lv_draw_buf_create(TILE_W,TILE_H,LV_COLOR_FORMAT_RGB565,LV_STRIDE_AUTO))) continue;
-            lv_canvas_set_draw_buf(t.canvas,t.pixels);
-            compose_tile(t,t.have_art?&t.art:nullptr);
+            if(!t.pixels) {
+                if(!(t.pixels=lv_draw_buf_create(TILE_W,TILE_H,LV_COLOR_FORMAT_RGB565,LV_STRIDE_AUTO))) continue;
+                lv_canvas_set_draw_buf(t.canvas,t.pixels);
+                compose_tile(t,t.have_art?&t.art:nullptr);
+            }
+            // Visible but artless: keep asking (10 s throttle inside) — the
+            // first pass may have run while the screen was off and the
+            // artwork worker drops tile jobs then.
             if(!t.have_art) request_tile_art(i);
         } else if(t.pixels) {
             lv_image_set_src(t.canvas,nullptr);  // detach the pixels before freeing them
@@ -472,7 +476,8 @@ void build_favorites(lv_obj_t* v) {
     lv_obj_align(fav_hint,LV_ALIGN_LEFT_MID,0,0);
     auto refresh=pill_button(top,"Refresh",false,favorites_refresh_clicked);
     lv_obj_align(refresh,LV_ALIGN_RIGHT_MID,0,0);
-    fav_grid=div(v); lv_obj_set_width(fav_grid,CONTENT_W-2*PAD); lv_obj_set_flex_grow(fav_grid,1);
+    fav_grid=div(v); lv_obj_add_flag(fav_grid,LV_OBJ_FLAG_SCROLLABLE);  // div() removes it
+    lv_obj_set_width(fav_grid,CONTENT_W-2*PAD); lv_obj_set_flex_grow(fav_grid,1);
     lv_obj_set_flex_flow(fav_grid,LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_style_pad_column(fav_grid,FAV_GAP,0); lv_obj_set_style_pad_row(fav_grid,32,0);
     lv_obj_set_scroll_dir(fav_grid,LV_DIR_VER); lv_obj_set_scrollbar_mode(fav_grid,LV_SCROLLBAR_MODE_ACTIVE);
