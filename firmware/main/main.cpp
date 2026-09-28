@@ -9,6 +9,7 @@
 #include "display_power.hpp"
 #include "esp_pm.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 #include "events.hpp"
 #include "ota.hpp"
 #include "debug.hpp"
@@ -42,13 +43,32 @@ QueueHandle_t commands;
 sonos::Client client(soap_http);
 std::string seed;
 std::vector<sonos::Favorite> favorites;  // the worker's copy, for artwork thumbnails
+std::vector<sonos::Room> published;      // the room list last pushed to the UI
 std::vector<Area> areas;
 bool initialized=false;
 bool storage_ok=true;
 bool catalog_loaded=false;
 // Speaker events arrive on the HTTP server task; they only nudge the worker.
-std::atomic<bool> event_pending{false}, topology_event{false};
+std::atomic<bool> event_pending{false}, topology_event{false}, content_event{false};
 std::atomic<TickType_t> last_event{0};
+
+bool same_rooms(const std::vector<sonos::Room>& a,const std::vector<sonos::Room>& b) {
+    if(a.size()!=b.size()) return false;
+    for(size_t i=0;i<a.size();++i)
+        if(a[i].id!=b[i].id || a[i].ip!=b[i].ip || a[i].coordinator!=b[i].coordinator || a[i].name!=b[i].name) return false;
+    return true;
+}
+bool same_favorites(const std::vector<sonos::Favorite>& a,const std::vector<sonos::Favorite>& b) {
+    if(a.size()!=b.size()) return false;
+    for(size_t i=0;i<a.size();++i)
+        if(a[i].id!=b[i].id || a[i].title!=b[i].title || a[i].art!=b[i].art || a[i].uri!=b[i].uri || a[i].radio!=b[i].radio) return false;
+    return true;
+}
+// Pushes a room list to the UI only when it actually changed: rebuilding the
+// room cards re-renders the screen, so polling must not call it blindly.
+void push_rooms(const std::vector<sonos::Room>& all) {
+    if(!same_rooms(all,published)) { published=all; ui_rooms(all); }
+}
 
 void load_areas() {
     for(int i=0;i<8;++i) {
@@ -114,6 +134,7 @@ void screen_woke() { auto c=new Command; c->action="Wake"; submit(c); }
 void speaker_event(const char* service) {
     last_event=xTaskGetTickCount();
     if(!std::strcmp(service,"ZoneGroupTopology")) topology_event=true;
+    if(!std::strcmp(service,"ContentDirectory")) content_event=true;
     if(event_pending.exchange(true)) return; // one refresh covers a burst
     auto c=new Command; c->action="Event";
     if(!submit(c)) event_pending=false;
@@ -137,7 +158,7 @@ void refresh() {
     ESP_LOGI(TAG,"Using speaker %s (%s), %u rooms",seed.c_str(),discovered?"discovered":"stored",static_cast<unsigned>(found.size()));
     save_known_speakers(found);
     favorites=client.favorites(seed);
-    ui_rooms(found);
+    published=found; ui_rooms(found);
     ui_favorites(favorites);
     catalog_loaded=true;
     ota_mark_healthy(); // a new image proves itself by reaching the speakers
@@ -156,6 +177,68 @@ std::string thumbnail_url(const std::string& uri) {
     return uri;
 }
 
+// --- artwork ---------------------------------------------------------------
+// Downloads and decodes on their own low-priority task: a slow cover must not
+// delay pause or volume behind it on the command worker. Now-playing art has
+// a depth-1 slot (only the newest matters); favorite tiles share a small FIFO
+// and anything that waited too long is dropped before a fetch starts.
+struct ArtJob {
+    sonos::Room room;          // now-playing target; ignored for tile jobs
+    std::string ip, uri;       // fetch source and requested art
+    bool now=false;            // now-playing slot vs tile FIFO
+    size_t tile=0;             // tile jobs: index into the favorites list
+    std::string fav_id;        // tile jobs: expected favorite id
+    int64_t queued=0;          // esp_timer time the job was posted
+};
+QueueHandle_t now_jobs=nullptr, tile_jobs=nullptr;
+constexpr int MAX_ART_SENDS=4;  // now-playing fetches per art URI before giving up
+
+void post_now_art(const sonos::Room& target,const std::string& uri) {
+    if(!now_jobs) return;
+    ArtJob* stale=nullptr;
+    xQueueReceive(now_jobs,&stale,0); delete stale;  // only the newest matters
+    auto job=new ArtJob; job->now=true; job->room=target; job->ip=target.ip; job->uri=uri; job->queued=esp_timer_get_time();
+    if(xQueueSend(now_jobs,&job,0)!=pdTRUE) delete job;
+}
+void post_tile_art(size_t index,const std::string& id,const std::string& uri) {
+    if(!tile_jobs || uri.empty()) return;
+    auto job=new ArtJob; job->tile=index; job->fav_id=id; job->uri=uri; job->queued=esp_timer_get_time();
+    if(xQueueSend(tile_jobs,&job,0)!=pdTRUE) delete job;
+}
+void artwork_worker(void*) {
+    auto set=xQueueCreateSet(9);
+    if(set) { xQueueAddToSet(now_jobs,set); xQueueAddToSet(tile_jobs,set); }
+    for(;;) {
+        ArtJob* job=nullptr;
+        if(set) {
+            auto member=xQueueSelectFromSet(set,portMAX_DELAY);
+            if(member) xQueueReceive(member,&job,0);
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(200));
+            if(xQueueReceive(now_jobs,&job,0)!=pdTRUE) xQueueReceive(tile_jobs,&job,0);
+        }
+        if(!job) continue;
+        std::unique_ptr<ArtJob> held(job);
+        // Tile art only matters while someone is looking; jobs older than
+        // 20 s describe scroll positions the user already left.
+        if((!job->now && screen_off()) || esp_timer_get_time()-job->queued>20*1000000LL) continue;
+        Artwork art;
+        try {
+            art=fetch_artwork(job->ip,job->uri,job->now?art_spec::now_side:art_spec::tile_side,
+                              job->now?art_spec::now_radius:art_spec::tile_radius,art_spec::background);
+        } catch(const std::exception& e) { ESP_LOGW(TAG,"artwork: %s",e.what()); }
+        if(job->now) {
+            const bool ok=art.pixels!=nullptr;
+            ui_artwork(job->room,std::move(art));
+            // Reports back for retry bookkeeping; a dropped report just means
+            // one extra fetch of the same cover.
+            auto done=new Command; done->action="ArtDone"; done->room=job->room;
+            done->name=job->uri; done->value=ok?1:0;
+            submit(done);
+        } else if(art.pixels) ui_favorite_art(job->fav_id,job->tile,std::move(art));
+    }
+}
+
 void worker(void*) {
     try {
         if(bsp_feature_enable(BSP_FEATURE_WIFI,true)!=ESP_OK) throw std::runtime_error("Cannot power the Wi-Fi module");
@@ -172,11 +255,13 @@ void worker(void*) {
     if(!boot->ssid.empty()) submit(boot);
     else { delete boot; ui_toast(storage_ok?"Connect to your home Wi-Fi to find your speakers.":"Settings storage failed; settings will not be saved.",!storage_ok); }
     TickType_t last_catalog_attempt=0, last_topology=0, last_battery=0, next_poll=0, last_rooms=0;
+    TickType_t last_queue=0, last_catalog_check=0, last_rediscovery=0;
     int queue_track=-1; std::string queue_room;  // what the Queue view shows
-    std::string art_uri="\x01", art_room;          // what the artwork panel shows
+    bool catalog_due=false, topology_stale=true;
+    unsigned failures=0;
+    std::string art_uri="\x01", art_room;          // what the artwork panel should show
+    unsigned art_sent=0; TickType_t art_next_try=0; bool art_done=false;
     std::vector<EventTarget> subscribed; TickType_t subscribed_at=0;
-    size_t next_thumbnail=0;
-    std::vector<size_t> thumbnail_retries;  // one more try for transient download failures
     bool was_online=false, radio_saving=false;
     // Standby follows CONFIG_TAB5_STANDBY_MINUTES with the screen off and the
     // selected room not playing. Unknown counts as playing.
@@ -188,14 +273,15 @@ void worker(void*) {
         const auto summary=client.summary(client.coordinator(target));
         playing=summary.playback=="PLAYING" || summary.playback=="TRANSITIONING";
     };
+    // Queued commands preempt the multi-request background reads below.
+    client.set_interrupt([]{ return uxQueueMessagesWaiting(commands)>0; });
+    auto invalidate=[&]{ client.invalidate_topology(); topology_stale=true; };
     for(;;) {
         // Sonos answers a new subscription with a full-state event, so an event
         // since subscribing proves events work and polling can relax.
         const bool events_live=subscribed_at && last_event.load()>=subscribed_at;
         const TickType_t now=xTaskGetTickCount();
-        // Favorite artwork loads in the gaps between polls and commands.
-        const bool thumbnails_pending=catalog_loaded && (next_thumbnail<favorites.size() || !thumbnail_retries.empty()) && !screen_off();
-        const TickType_t wait=thumbnails_pending?0:(next_poll>now?next_poll-now:0);
+        const TickType_t wait=next_poll>now?next_poll-now:0;
         Command* raw=nullptr;
         xQueueReceive(commands,&raw,wait);
         std::unique_ptr<Command> c(raw);
@@ -215,7 +301,7 @@ void worker(void*) {
                 for(int i=0;i<150 && !network_online();++i) vTaskDelay(pdMS_TO_TICKS(100));
                 quiet_since=0; playing=true;
                 subscribed.clear();       // subscriptions lapsed while offline
-                client.invalidate_topology();
+                invalidate();
                 next_poll=0;
                 continue;
             }
@@ -224,7 +310,7 @@ void worker(void*) {
             if(!c && initialized && !catalog_loaded && network_online() &&
                xTaskGetTickCount()-last_catalog_attempt>pdMS_TO_TICKS(30000)) {
                 last_catalog_attempt=xTaskGetTickCount();
-                refresh(); next_thumbnail=0; thumbnail_retries.clear();
+                refresh(); last_catalog_check=xTaskGetTickCount();
             }
             if(c) {
                 const auto& a=c->action;
@@ -232,10 +318,23 @@ void worker(void*) {
                 if(a=="Connect") {
                     if(!c->seed.empty() && !sonos::valid_ipv4(c->seed)) throw std::runtime_error("Enter a valid speaker IP address");
                     network_connect(c->ssid,c->password); if(storage_ok) save_settings(*c); seed=c->seed;
-                    refresh(); next_thumbnail=0; thumbnail_retries.clear();
+                    refresh(); catalog_due=false; last_catalog_check=xTaskGetTickCount();
                     ui_toast("Connected"); ui_show(View::NowPlaying);
-                } else if(a=="Refresh") { refresh(); next_thumbnail=0; thumbnail_retries.clear(); }
+                } else if(a=="Refresh") { refresh(); catalog_due=false; last_catalog_check=xTaskGetTickCount(); }
                 else if(a=="Favorite") client.play_favorite(c->room,c->favorite);
+                else if(a=="TileArt") {
+                    // Verify the index and id together; the list may have been
+                    // reloaded since the UI asked.
+                    const size_t index=static_cast<size_t>(c->value);
+                    if(index<favorites.size() && favorites[index].id==c->name)
+                        post_tile_art(index,c->name,thumbnail_url(favorites[index].art));
+                }
+                else if(a=="ArtDone") {
+                    // Retry bookkeeping for the Now Playing cover; failures
+                    // re-enter through the deadline below, so a dropped report
+                    // costs at most one extra fetch.
+                    if(c->room.id==art_room && c->name==art_uri) art_done=c->value!=0 || art_sent>=MAX_ART_SENDS;
+                }
                 else if(a=="Volume") client.volume(c->room,c->value);
                 else if(a=="GroupVolume") client.volume(c->room,c->value,true);
                 else if(a=="Mute") client.mute(c->room,c->value);
@@ -243,15 +342,21 @@ void worker(void*) {
                 else if(a=="SaveArea") save_area(*c);
                 else if(a=="Area" || a=="Group") {
                     client.apply_area(seed,c->area_ids);
-                    ui_rooms(client.rooms(seed)); ui_select(c->area_ids.front());
+                    push_rooms(client.rooms(seed)); ui_select(c->area_ids.front());
                     if(a=="Area") ui_toast(c->name+" is grouped");
                     last_rooms=0;
                 }
-                else if(a=="Wake") client.invalidate_topology();
-                else if(a=="Event") { event_pending=false; if(topology_event.exchange(false)) { client.invalidate_topology(); last_rooms=0; } }
+                else if(a=="Wake") invalidate();
+                else if(a=="Event") {
+                    event_pending=false;
+                    if(topology_event.exchange(false)) { invalidate(); last_rooms=0; }
+                    // Queue and favorites can both change through another app.
+                    if(content_event.exchange(false)) { queue_track=-1; catalog_due=true; }
+                }
                 else if(a=="Queue") queue_track=-1;
                 else if(a=="QueueTrack") { client.play_queue_track(c->room,c->value); queue_track=-1; }
                 else if(a!="Poll") client.transport(c->room,a);
+                failures=0;  // a successful command proves the speakers are reachable
             }
             if(!last_battery || xTaskGetTickCount()-last_battery>pdMS_TO_TICKS(30000)) {
                 last_battery=xTaskGetTickCount();
@@ -262,24 +367,9 @@ void worker(void*) {
             }
             // External regrouping is picked up within 30 s even without events.
             if(xTaskGetTickCount()-last_topology>pdMS_TO_TICKS(30000)) {
-                client.invalidate_topology(); last_topology=xTaskGetTickCount();
+                invalidate(); last_topology=xTaskGetTickCount();
             }
-            if(!c && xTaskGetTickCount()<next_poll) {
-                if(thumbnails_pending) {
-                    const bool retry=next_thumbnail>=favorites.size();
-                    const size_t index=retry?thumbnail_retries.back():next_thumbnail++;
-                    if(retry) thumbnail_retries.pop_back();
-                    const auto& f=favorites[index];
-                    Artwork art;
-                    if(!f.art.empty()) try { art=fetch_artwork(seed,thumbnail_url(f.art),art_spec::tile_side,art_spec::tile_radius,art_spec::background); }
-                    catch(const std::exception& e) {
-                        ESP_LOGW(TAG,"Favorite art for %s: %s",f.title.c_str(),e.what());
-                        if(!retry) thumbnail_retries.push_back(index);
-                    }
-                    if(art.pixels) ui_favorite_art(f.id,std::move(art));
-                }
-                continue;
-            }
+            if(!c && xTaskGetTickCount()<next_poll) continue;
             next_poll=xTaskGetTickCount()+pdMS_TO_TICKS(events_live?15000:4000);
             if(screen_off() && (!c || c->action=="Event")) {
                 // Nobody is looking: skip the refresh, but note whether the
@@ -292,45 +382,92 @@ void worker(void*) {
             const auto state=client.state(target);
             ui_state(target,state);
             playing=state.playback=="PLAYING" || state.playback=="TRANSITIONING";
+            failures=0;  // a successful refresh proves the speakers are reachable
             const auto leader=client.coordinator(target);
             std::vector<EventTarget> targets{{leader.ip,"AVTransport"},{target.ip,"RenderingControl"},
-                                             {leader.ip,"GroupRenderingControl"},{leader.ip,"ZoneGroupTopology"}};
+                                             {leader.ip,"GroupRenderingControl"},{leader.ip,"ZoneGroupTopology"},
+                                             {leader.ip,"ContentDirectory"}};
             if(targets!=subscribed) { events_set_targets(targets); subscribed=targets; subscribed_at=xTaskGetTickCount(); }
+            // Regrouping also decides room vs group controls on Now Playing,
+            // so topology changes are published no matter which view is open.
+            std::vector<sonos::Room> fresh_rooms;
+            if(topology_stale) {
+                fresh_rooms=client.rooms(seed);
+                topology_stale=false;
+                push_rooms(fresh_rooms);
+            }
+            // Track changes queue a fetch on the artwork task; a transient
+            // failure is retried with widening gaps, bounded per URI.
             if(state.art!=art_uri || target.id!=art_room) {
                 art_uri=state.art; art_room=target.id;
-                Artwork art;
-                if(!state.art.empty()) try { art=fetch_artwork(target.ip,state.art,art_spec::now_side,art_spec::now_radius,art_spec::background); }
-                catch(const std::exception& e) { ESP_LOGW(TAG,"Artwork unavailable: %s",e.what()); }
-                ui_artwork(target,std::move(art));
+                art_done=art_uri.empty(); art_sent=0; art_next_try=0;
+                if(art_uri.empty()) ui_artwork(target,Artwork{});
+            }
+            if(!art_done && art_sent<MAX_ART_SENDS && xTaskGetTickCount()>=art_next_try) {
+                post_now_art(target,art_uri);
+                ++art_sent;
+                art_next_try=xTaskGetTickCount()+pdMS_TO_TICKS(art_sent==1?10000:art_sent==2?30000:60000);
             }
             const auto view=ui_view();
-            if(view==View::Queue && (state.track!=queue_track || target.id!=queue_room)) {
+            // External edits leave stale rows while the track stays put, so
+            // the window reloads on content events and every 60 s.
+            if(view==View::Queue && (state.track!=queue_track || target.id!=queue_room ||
+                                     xTaskGetTickCount()-last_queue>pdMS_TO_TICKS(60000))) {
                 // Show a window from just before the current track onwards.
                 int total=0; const int start=std::max(0,state.track-3);
                 auto items=client.queue(target,start,50,&total);
                 ui_queue(target,items,total,state.track);
-                queue_track=state.track; queue_room=target.id;
+                queue_track=state.track; queue_room=target.id; last_queue=xTaskGetTickCount();
             }
             if(view==View::Rooms && (c || !last_rooms || xTaskGetTickCount()-last_rooms>pdMS_TO_TICKS(15000))) {
                 // Room cards show what every group is playing: fresh topology,
                 // then two calls per group coordinator.
                 last_rooms=xTaskGetTickCount();
-                auto all=client.rooms(seed);
-                ui_rooms(all);
+                auto all=fresh_rooms.empty()?client.rooms(seed):fresh_rooms;
+                push_rooms(all);
                 std::vector<std::pair<std::string,sonos::Summary>> summaries;
                 for(const auto& r:all) if(r.id==r.coordinator) {
+                    // Queued commands outrank room summaries; the next pass
+                    // fills in the rest.
+                    if(uxQueueMessagesWaiting(commands)) break;
                     try { summaries.emplace_back(r.id,client.summary(r)); }
                     catch(const std::exception& e) { ESP_LOGW(TAG,"Summary for %s: %s",r.name.c_str(),e.what()); }
                 }
                 ui_summaries(summaries);
             }
+            // Favorites change through the Sonos app too: recheck on content
+            // events and every 30 minutes, pushing only real changes.
+            if(catalog_loaded &&
+               (catalog_due || xTaskGetTickCount()-last_catalog_check>pdMS_TO_TICKS(30*60000)) &&
+               xTaskGetTickCount()-last_catalog_check>pdMS_TO_TICKS(60000)) {
+                last_catalog_check=xTaskGetTickCount(); catalog_due=false;
+                try {
+                    auto fresh_favorites=client.favorites(seed);
+                    if(!same_favorites(fresh_favorites,favorites)) { favorites=fresh_favorites; ui_favorites(fresh_favorites); }
+                } catch(const sonos::Preempted&) {
+                    // A queued command stopped the check; it runs again later.
+                } catch(const std::exception& e) { ESP_LOGW(TAG,"Favorites check: %s",e.what()); }
+            }
+        } catch(const sonos::Preempted&) {
+            // A queued command stopped a background read; it runs next.
         } catch(const std::exception& e) {
             // Drop queued actions after any failure; never replay a possibly completed queue mutation.
             Command* pending=nullptr;
             while(xQueueReceive(commands,&pending,0)==pdTRUE) delete pending;
             event_pending=false;
-            client.invalidate_topology();
+            invalidate();
             ui_toast(e.what(),true); ESP_LOGE(TAG,"Controller operation failed: %s",e.what());
+            // Repeated failures mean the stored speaker addresses are probably
+            // stale; rediscover, keeping the selection by room id. Bounded to
+            // one attempt a minute so a dead speaker cannot stall the worker.
+            if(++failures>=5 && initialized && network_online() &&
+               xTaskGetTickCount()-last_rediscovery>pdMS_TO_TICKS(60000)) {
+                last_rediscovery=xTaskGetTickCount();
+                try {
+                    ESP_LOGW(TAG,"%u failed operations; rediscovering speakers",failures);
+                    refresh(); failures=0;
+                } catch(const std::exception& again) { ESP_LOGW(TAG,"Rediscovery: %s",again.what()); }
+            }
         }
     }
 }
@@ -483,7 +620,9 @@ extern "C" void app_main() {
     if(!display) {ESP_LOGE(TAG,"Display initialization failed");return;}
     bsp_display_backlight_on();
     commands=xQueueCreate(8,sizeof(Command*));
-    if(!commands) return;
+    now_jobs=xQueueCreate(1,sizeof(ArtJob*));
+    tile_jobs=xQueueCreate(8,sizeof(ArtJob*));
+    if(!commands || !now_jobs || !tile_jobs) return;
     bsp_display_lock(0);
     lv_display_set_rotation(display,LV_DISPLAY_ROTATION_90);
     fast_flush_install(display);
@@ -496,4 +635,6 @@ extern "C" void app_main() {
     esp_pm_config_t pm={}; pm.max_freq_mhz=CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ; pm.min_freq_mhz=40;
     if(auto result=esp_pm_configure(&pm); result!=ESP_OK) ESP_LOGW(TAG,"Frequency scaling unavailable: %s",esp_err_to_name(result));
     if(xTaskCreate(worker,"sonos",24576,nullptr,4,nullptr)!=pdPASS) ui_toast("Unable to start the controller task",true);
+    // Lower priority than the command worker; HTTPS needs a generous stack.
+    if(xTaskCreate(artwork_worker,"artwork",12288,nullptr,3,nullptr)!=pdPASS) ui_toast("Unable to start the artwork task",true);
 }

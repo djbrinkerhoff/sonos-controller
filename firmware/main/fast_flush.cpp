@@ -4,6 +4,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include <atomic>
 
 namespace {
 const char* TAG="fast_flush";
@@ -21,18 +22,29 @@ uint16_t* framebuffer=nullptr;
 // progress: a lost completion costs one stale band, never a hang.
 SemaphoreHandle_t band_done=nullptr;
 volatile uint32_t lost_completions=0;
+// Waits are keyed to the transaction, not the semaphore: a late interrupt can
+// only wake a waiter, never satisfy a later band's wait. The band is released
+// to LVGL only once its own completion has arrived, so a render buffer is
+// never recycled while the PPA might still read it. A dead engine still drops
+// the band after one second rather than hanging LVGL.
+std::atomic<uint32_t> band_started{0}, band_finished{0};
 
 bool IRAM_ATTR rotated(ppa_client_handle_t,ppa_event_data_t*,void*) {
+    band_finished.fetch_add(1);
     BaseType_t woken=pdFALSE;
     xSemaphoreGiveFromISR(band_done,&woken);
     return woken==pdTRUE;
 }
 void wait_for_band(lv_display_t* display) {
-    if(xSemaphoreTake(band_done,pdMS_TO_TICKS(50))!=pdTRUE) ++lost_completions;
+    const uint32_t seq=band_started.load();
+    // ~15 ms is normal; stalls seen on hardware (OTA flash writes pausing
+    // PSRAM access) finished in well under a second.
+    for(int slice=0;slice<20 && band_finished.load()<seq;++slice)
+        if(xSemaphoreTake(band_done,pdMS_TO_TICKS(50))!=pdTRUE) ++lost_completions;
     lv_display_flush_ready(display);
 }
 void flush(lv_display_t* display,const lv_area_t* area,uint8_t* pixels) {
-    if(!framebuffer) { xSemaphoreGive(band_done); return; }  // suspended: nothing to show
+    if(!framebuffer) return;  // suspended: nothing to show, nothing to wait for
     const int w=lv_area_get_width(area), h=lv_area_get_height(area);
     // Same mapping as esp_lvgl_port's PPA path for LV_DISPLAY_ROTATION_90.
     ppa_srm_oper_config_t op={};
@@ -45,7 +57,8 @@ void flush(lv_display_t* display,const lv_area_t* area,uint8_t* pixels) {
     op.rotation_angle=static_cast<ppa_srm_rotation_angle_t>(LV_DISPLAY_ROTATION_90);
     op.scale_x=1.0f; op.scale_y=1.0f;
     op.mode=PPA_TRANS_MODE_NON_BLOCKING; op.user_data=display;
-    if(ppa_do_scale_rotate_mirror(ppa,&op)!=ESP_OK) xSemaphoreGive(band_done);  // nothing to wait for
+    band_started.fetch_add(1);
+    if(ppa_do_scale_rotate_mirror(ppa,&op)!=ESP_OK) band_finished.fetch_add(1);  // nothing to wait for
 }
 // The first fields of esp_lvgl_port 2.6's private per-display context. The
 // result is verified below by asking the panel for its framebuffer.

@@ -47,6 +47,7 @@ std::string sta_ip() {
 
 std::string event_path(const std::string& service) {
     if(service=="ZoneGroupTopology") return "/ZoneGroupTopology/Event";
+    if(service=="ContentDirectory") return "/MediaServer/"+service+"/Event";
     return "/MediaRenderer/"+service+"/Event";
 }
 

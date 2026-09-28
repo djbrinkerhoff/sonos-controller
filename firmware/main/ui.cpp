@@ -158,25 +158,42 @@ ArtFrame now_art;
 lv_obj_t *np_title,*np_artist,*np_album,*np_progress,*np_elapsed,*np_remaining,*np_times;
 lv_obj_t *np_prev,*np_play,*np_next,*np_mute,*np_volume,*np_volume_value,*np_volume_caption,*np_empty_hint;
 // Favorites
-lv_obj_t* fav_grid;
+lv_obj_t* fav_grid,*fav_hint;
 // Each favorite tile is one pre-composed image: cover (or placeholder), title
 // and radio badge drawn once onto a canvas. As separate widgets (card, frame,
 // image, title, badge) the ~90 objects cost ~13 ms per scroll frame in tree
 // walks and per-object draw events, plus time moving them on every scroll step.
 constexpr int32_t TILE_W=art_spec::tile_side, TILE_TITLE_Y=art_spec::tile_side+8, TILE_H=TILE_TITLE_Y+72;
-// The grid's column gap (applied as the view's pad_column). An even stride keeps
+// The grid's column gap (applied as the grid's pad_column). An even stride keeps
 // each tile's destination offset 4-byte aligned, and five columns must fit.
 constexpr int32_t FAV_COLUMNS=5, FAV_GAP=22;
 static_assert((TILE_W+FAV_GAP)%2==0 && PAD%2==0,"tile x positions must stay even");
 static_assert(FAV_COLUMNS*TILE_W+(FAV_COLUMNS-1)*FAV_GAP<=CONTENT_W-2*PAD,"five favorite tiles must fit a row");
+// Every favorite gets a canvas, but the ~103 KB draw buffer behind it exists
+// only while the tile sits near the viewport: one buffer each at the accepted
+// 1,000-item catalog would need over 103 MiB. Covers are fetched on demand for
+// the same window and released together with their buffers.
 struct Tile {
     lv_obj_t* canvas=nullptr;
-    lv_draw_buf_t* pixels=nullptr;
-    std::string title;  // wrapped and "..."-truncated by a label once
-    bool radio=false;
+    lv_draw_buf_t* pixels=nullptr;   // only while inside the cache window
+    Artwork art;                     // decoded cover while the tile is buffered
+    std::string title;               // wrapped and "..."-truncated by a label once
+    bool radio=false, have_art=false;
+    int64_t art_asked=0;             // esp_timer time of the last art request
+    Tile()=default;
+    Tile(Tile&& o) noexcept { *this=std::move(o); }
+    Tile& operator=(Tile&& o) noexcept {
+        if(this!=&o) {
+            canvas=o.canvas; pixels=o.pixels; art=std::move(o.art); title=std::move(o.title);
+            radio=o.radio; have_art=o.have_art; art_asked=o.art_asked; o.pixels=nullptr;
+        }
+        return *this;
+    }
+    Tile(const Tile&)=delete;
+    Tile& operator=(const Tile&)=delete;
     ~Tile() { if(pixels) lv_draw_buf_destroy(pixels); }
 };
-std::map<std::string,Tile> tiles;  // node-stable, so the image descriptors stay put
+std::vector<Tile> tiles;
 // Queue, Rooms, Settings
 lv_obj_t *queue_list,*queue_header;
 lv_obj_t *rooms_title,*rooms_actions,*area_row,*room_grid;
@@ -200,10 +217,12 @@ void render_room_chip() {
 void render_device_info();
 void render_rooms();
 void render_now_playing();
+void update_tile_cache();
 
 void show_view(View next) {
     // Queue and Rooms load on demand; a busy worker picks them up on its next poll.
     if(next!=view && (next==View::Queue || next==View::Rooms)) submit(for_room(next==View::Queue?"Queue":"Poll"));
+    if(next==View::Favorites) update_tile_cache();
     view=next;
     for(int i=0;i<5;++i) lv_obj_set_flag(views[i],LV_OBJ_FLAG_HIDDEN,i!=static_cast<int>(next));
     lv_obj_add_flag(keyboard,LV_OBJ_FLAG_HIDDEN);
@@ -374,26 +393,65 @@ void compose_tile(Tile& t,const Artwork* art) {
     lv_draw_label(&layer,&title,&title_area);
     lv_canvas_finish_layer(t.canvas,&layer);
 }
+// Asks the worker for a tile's cover. Tiles stay artless if the queue is
+// full; the next scroll pass asks again, at most once every 10 s per tile.
+void request_tile_art(size_t index) {
+    auto& t=tiles[index];
+    const int64_t now=esp_timer_get_time();
+    if(t.have_art || now-t.art_asked<10*1000000LL) return;
+    auto k=new Command; k->action="TileArt"; k->value=static_cast<int>(index); k->name=favorites[index].id;
+    if(submit(k)) t.art_asked=now;
+}
+// Holds draw buffers for the rows around the viewport (plus two rows of
+// margin in each direction) and releases the rest; covers are requested when
+// a tile enters the window.
+constexpr int32_t FAV_PITCH=TILE_H+32;  // tile height + pad_row
+void update_tile_cache() {
+    const int32_t top=lv_obj_get_scroll_y(fav_grid);
+    const int32_t lo_row=std::max<int32_t>(0,top/FAV_PITCH-1);
+    const int32_t hi_row=(top+lv_obj_get_height(fav_grid))/FAV_PITCH+2;
+    const size_t lo=static_cast<size_t>(lo_row)*FAV_COLUMNS;
+    const size_t hi=std::min<size_t>(tiles.size(),static_cast<size_t>(hi_row+1)*FAV_COLUMNS);
+    for(size_t i=0;i<tiles.size();++i) {
+        auto& t=tiles[i];
+        if(i>=lo && i<hi) {
+            if(t.pixels) continue;
+            if(!(t.pixels=lv_draw_buf_create(TILE_W,TILE_H,LV_COLOR_FORMAT_RGB565,LV_STRIDE_AUTO))) continue;
+            lv_canvas_set_draw_buf(t.canvas,t.pixels);
+            compose_tile(t,t.have_art?&t.art:nullptr);
+            if(!t.have_art) request_tile_art(i);
+        } else if(t.pixels) {
+            lv_image_set_src(t.canvas,nullptr);  // detach the pixels before freeing them
+            lv_draw_buf_destroy(t.pixels); t.pixels=nullptr;
+            t.art=Artwork{}; t.have_art=false;
+        }
+    }
+}
+void fav_scrolled(lv_event_t*) { update_tile_cache(); }
+void favorites_refresh_clicked(lv_event_t*) { auto k=new Command; k->action="Refresh"; send(k); }
 void render_favorites() {
     lv_obj_clean(fav_grid); tiles.clear();  // widgets first, then the pixels they showed
+    lv_obj_scroll_to_y(fav_grid,0,LV_ANIM_OFF);
     if(favorites.empty()) {
+        lv_label_set_text(fav_hint,"");
         auto l=text(fav_grid,&font_body_26,ink::muted,"No Apple Music or Sonos Radio favorites yet.\nAdd some in the Sonos app; they appear here automatically.");
         lv_obj_set_width(l,CONTENT_W-2*PAD);
         return;
     }
-
+    lv_label_set_text_fmt(fav_hint,"%u favorites",static_cast<unsigned>(favorites.size()));
     // One label, reused, does the wrapping and "..." truncation for every title.
     auto measure=text(fav_grid,&font_body_26,ink::text,"");
     lv_obj_set_size(measure,TILE_W,72); lv_label_set_long_mode(measure,LV_LABEL_LONG_DOT);
     lv_obj_set_style_text_line_space(measure,2,0); lv_obj_add_flag(measure,LV_OBJ_FLAG_IGNORE_LAYOUT);
+    tiles.clear(); tiles.resize(favorites.size());
     for(size_t i=0;i<favorites.size();++i) {
         const auto& f=favorites[i];
-        auto& t=tiles[f.id+"#"+std::to_string(i)];
+        auto& t=tiles[i];
         t.radio=f.radio;
         lv_label_set_text(measure,f.title.c_str()); lv_obj_update_layout(measure);
         t.title=lv_label_get_text(measure);
-        if(!(t.pixels=lv_draw_buf_create(TILE_W,TILE_H,LV_COLOR_FORMAT_RGB565,LV_STRIDE_AUTO))) continue;
-        t.canvas=lv_canvas_create(fav_grid); lv_canvas_set_draw_buf(t.canvas,t.pixels);
+        t.canvas=lv_canvas_create(fav_grid);  // no draw buffer until it nears the viewport
+        lv_obj_set_size(t.canvas,TILE_W,TILE_H);
         lv_obj_add_flag(t.canvas,LV_OBJ_FLAG_CLICKABLE);
         lv_obj_remove_flag(t.canvas,LV_OBJ_FLAG_SCROLL_ON_FOCUS);
         lv_obj_add_event_cb(t.canvas,favorite_clicked,LV_EVENT_CLICKED,reinterpret_cast<void*>(i));
@@ -401,16 +459,25 @@ void render_favorites() {
         lv_obj_set_style_outline_width(t.canvas,3,LV_STATE_PRESSED);
         lv_obj_set_style_outline_pad(t.canvas,6,LV_STATE_PRESSED);
         lv_obj_set_style_radius(t.canvas,art_spec::tile_radius,LV_STATE_PRESSED);
-        compose_tile(t,nullptr);
     }
     lv_obj_delete(measure);
+    update_tile_cache();
 }
 void build_favorites(lv_obj_t* v) {
-    fav_grid=v;
-    lv_obj_set_flex_flow(v,LV_FLEX_FLOW_ROW_WRAP);
-    lv_obj_set_style_pad_all(v,PAD,0); lv_obj_set_style_pad_top(v,24,0);
-    lv_obj_set_style_pad_column(v,FAV_GAP,0); lv_obj_set_style_pad_row(v,32,0);
-    text(v,&font_body_26,ink::muted,"Connect to Wi-Fi in Settings to find your Sonos system.");
+    lv_obj_remove_flag(v,LV_OBJ_FLAG_SCROLLABLE);  // the grid scrolls, the header stays put
+    lv_obj_set_flex_flow(v,LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_all(v,PAD,0); lv_obj_set_style_pad_top(v,24,0); lv_obj_set_style_pad_row(v,16,0);
+    auto top=div(v); lv_obj_set_size(top,CONTENT_W-2*PAD,TARGET);
+    fav_hint=text(top,&font_body_26,ink::muted,"Connect to Wi-Fi in Settings to find your Sonos system.");
+    lv_obj_align(fav_hint,LV_ALIGN_LEFT_MID,0,0);
+    auto refresh=pill_button(top,"Refresh",false,favorites_refresh_clicked);
+    lv_obj_align(refresh,LV_ALIGN_RIGHT_MID,0,0);
+    fav_grid=div(v); lv_obj_set_width(fav_grid,CONTENT_W-2*PAD); lv_obj_set_flex_grow(fav_grid,1);
+    lv_obj_set_flex_flow(fav_grid,LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_style_pad_column(fav_grid,FAV_GAP,0); lv_obj_set_style_pad_row(fav_grid,32,0);
+    lv_obj_set_scroll_dir(fav_grid,LV_DIR_VER); lv_obj_set_scrollbar_mode(fav_grid,LV_SCROLLBAR_MODE_ACTIVE);
+    lv_obj_add_event_cb(fav_grid,fav_scrolled,LV_EVENT_SCROLL,nullptr);
+    lv_obj_add_event_cb(fav_grid,fav_scrolled,LV_EVENT_SIZE_CHANGED,nullptr);
 }
 
 // ---- Queue ----------------------------------------------------------------------------
@@ -563,7 +630,8 @@ void connect_clicked(lv_event_t*) {
     auto k=new Command; k->action="Connect";
     k->ssid=lv_textarea_get_text(ssid_input); k->password=lv_textarea_get_text(password_input); k->seed=lv_textarea_get_text(seed_input);
     lv_obj_add_flag(keyboard,LV_OBJ_FLAG_HIDDEN);
-    if(submit(k)) ui_toast("Connecting to "+k->ssid+"..."); else ui_toast("Still working on the last request. Try again.",true);
+    const auto ssid=k->ssid;  // submit() takes ownership; the command may already be gone
+    if(submit(k)) ui_toast("Connecting to "+ssid+"..."); else ui_toast("Still working on the last request. Try again.",true);
 }
 void render_device_info() {
     std::string info;
@@ -702,13 +770,16 @@ void ui_rooms(const std::vector<sonos::Room>& fresh) {
     render_room_chip(); render_rooms(); render_now_playing();
 }
 void ui_favorites(const std::vector<sonos::Favorite>& fresh) { DisplayLock lock; favorites=fresh; render_favorites(); }
-void ui_favorite_art(const std::string& id,Artwork art) {
+// id+index together identify the tile, so a cover fetched for an older
+// catalog can never land on a different favorite after a reload.
+void ui_favorite_art(const std::string& id,size_t index,Artwork art) {
     DisplayLock lock;
-    for(size_t i=0;i<favorites.size();++i) if(favorites[i].id==id) {
-        auto it=tiles.find(id+"#"+std::to_string(i));
-        if(it!=tiles.end() && it->second.canvas) { compose_tile(it->second,&art); lv_obj_invalidate(it->second.canvas); }
-        return;  // the cover pixels are now part of the tile; art is freed here
-    }
+    if(index>=favorites.size() || index>=tiles.size() || favorites[index].id!=id) return;
+    auto& t=tiles[index];
+    if(!t.pixels) return;  // scrolled out of the cache window; the fetch is dropped
+    t.art=std::move(art); t.have_art=t.art.pixels!=nullptr;
+    compose_tile(t,t.have_art?&t.art:nullptr);
+    lv_obj_invalidate(t.canvas);
 }
 void ui_state(const sonos::Room& room,const sonos::State& state) {
     DisplayLock lock;

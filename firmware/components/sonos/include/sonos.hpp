@@ -1,6 +1,7 @@
 #pragma once
 #include <functional>
 #include <map>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -25,6 +26,10 @@ struct State {
 };
 // What a group is playing, for room overviews: two calls instead of state()'s six.
 struct Summary { std::string title, artist, playback; };
+// Thrown by multi-request reads when the callback given to set_interrupt()
+// asks them to stop between calls, so queued commands can run first. Any
+// partial result is discarded; the read can simply be started again.
+struct Preempted : std::runtime_error { Preempted() : std::runtime_error("read preempted by a queued command") {} };
 int parse_clock(const std::string& hms);  // "H:MM:SS" -> seconds, -1 if not a time
 std::string escape(const std::string& value);
 Fields parse_response(const std::string& xml);
@@ -56,8 +61,12 @@ public:
     // grouping change is made, or a room is missing from it.
     void invalidate_topology() { topology_.clear(); }
     Room coordinator(const Room& room);
+    // Checked between the requests of multi-call reads (state, favorites);
+    // return true to abandon the read early with Preempted.
+    void set_interrupt(std::function<bool()> interrupt) { interrupt_ = std::move(interrupt); }
 private:
     Transport transport_;
+    std::function<bool()> interrupt_;
     Fields services_;
     std::vector<Room> topology_;
     Fields call(const std::string& ip, const std::string& service,

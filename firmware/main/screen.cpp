@@ -1,5 +1,6 @@
 #include "screen.hpp"
 #include "display_power.hpp"
+#include "power.hpp"
 #include "bsp/esp-bsp.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -21,6 +22,10 @@ lv_obj_t* shield=nullptr;
 
 bool dark(Level l) { return l==Level::Off || l==Level::Deep; }
 void set_level(Level next) {
+    // Deep stops the panel stream; only motion can wake it (on ST7121 the
+    // touch controller stops scanning too). With no working motion sensor
+    // there would be no way back, so the display stays touch-wakeable.
+    if(next==Level::Deep && !motion_active()) next=Level::Off;
     const Level was=level.exchange(next);
     if(was==next) return;
     const int percent=next==Level::Awake?100:next==Level::Dim?CONFIG_TAB5_DIM_PERCENT:0;

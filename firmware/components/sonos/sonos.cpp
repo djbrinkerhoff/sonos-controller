@@ -249,6 +249,7 @@ std::vector<Favorite> Client::favorites(const std::string& seed) {
     std::vector<Favorite> result;
     std::string update;
     for (int start = 0; start < 1000;) {
+        if (start && interrupt_ && interrupt_()) throw Preempted();
         auto response = call(seed,"ContentDirectory","Browse",{{"ObjectID","FV:2"},{"BrowseFlag","BrowseDirectChildren"},{"Filter","*"},{"StartingIndex",std::to_string(start)},{"RequestedCount","64"},{"SortCriteria",""}});
         if (start && response.at("UpdateID") != update) throw std::runtime_error("Favorites changed; refresh again");
         update = response.at("UpdateID");
@@ -273,12 +274,19 @@ std::vector<QueueItem> Client::queue(const Room& room, int start, int count, int
 }
 State Client::state(const Room& room) {
     auto target = coordinator(room);
+    auto hold = [&] { if (interrupt_ && interrupt_()) throw Preempted(); };
     auto p = call(target.ip,"AVTransport","GetPositionInfo",{{"InstanceID","0"}});
+    hold();
     auto t = call(target.ip,"AVTransport","GetTransportInfo",{{"InstanceID","0"}});
+    hold();
     auto a = call(target.ip,"AVTransport","GetCurrentTransportActions",{{"InstanceID","0"}});
+    hold();
     auto v = call(room.ip,"RenderingControl","GetVolume",{{"InstanceID","0"},{"Channel","Master"}});
+    hold();
     auto m = call(room.ip,"RenderingControl","GetMute",{{"InstanceID","0"},{"Channel","Master"}});
+    hold();
     auto g = call(target.ip,"GroupRenderingControl","GetGroupVolume",{{"InstanceID","0"}});
+    hold();
     auto gm = call(target.ip,"GroupRenderingControl","GetGroupMute",{{"InstanceID","0"}});
     State s;
     s.playback=t["CurrentTransportState"]; s.actions=a["Actions"];

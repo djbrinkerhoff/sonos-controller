@@ -27,7 +27,9 @@ void ui_select(const std::string& room_id);
 
 void ui_rooms(const std::vector<sonos::Room>& rooms);
 void ui_favorites(const std::vector<sonos::Favorite>& favorites);
-void ui_favorite_art(const std::string& favorite_id, Artwork art);
+// index is the favorite's position in the last ui_favorites list; the id is
+// checked too so art cannot land on a different favorite after a reload.
+void ui_favorite_art(const std::string& favorite_id, size_t index, Artwork art);
 void ui_state(const sonos::Room& room, const sonos::State& state);
 void ui_artwork(const sonos::Room& room, Artwork art);
 void ui_queue(const sonos::Room& room, const std::vector<sonos::QueueItem>& items, int total, int track);
