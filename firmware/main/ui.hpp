@@ -34,7 +34,6 @@ void ui_state(const sonos::Room& room, const sonos::State& state);
 void ui_artwork(const sonos::Room& room, Artwork art);
 void ui_queue(const sonos::Room& room, const std::vector<sonos::QueueItem>& items, int total, int track);
 void ui_summaries(const std::vector<std::pair<std::string, sonos::Summary>>& by_coordinator);
-void ui_areas(const std::vector<Area>& areas);
 void ui_battery(const Battery& battery);
 void ui_online(bool online);
 void ui_toast(const std::string& text, bool error = false);

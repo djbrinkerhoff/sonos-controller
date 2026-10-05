@@ -44,7 +44,6 @@ sonos::Client client(soap_http);
 std::string seed;
 std::vector<sonos::Favorite> favorites;  // the worker's copy, for artwork thumbnails
 std::vector<sonos::Room> published;      // the room list last pushed to the UI
-std::vector<Area> areas;
 bool initialized=false;
 bool storage_ok=true;
 bool catalog_loaded=false;
@@ -70,38 +69,6 @@ void push_rooms(const std::vector<sonos::Room>& all) {
     if(!same_rooms(all,published)) { published=all; ui_rooms(all); }
 }
 
-void load_areas() {
-    for(int i=0;i<8;++i) {
-        auto data=setting(("area"+std::to_string(i)).c_str());
-        if(data.empty()) continue;
-        std::istringstream stream(data); Area area; std::getline(stream,area.name);
-        std::string id; while(std::getline(stream,id)) if(!id.empty()) area.ids.push_back(id);
-        if(!area.name.empty() && !area.ids.empty()) areas.push_back(std::move(area));
-    }
-}
-void save_area(const Command& command) {
-    if(command.name.empty() || command.name.size()>32 || command.name.find('\n')!=std::string::npos)
-        throw std::runtime_error("Name the area using 1 to 32 characters");
-    auto topology=client.rooms(command.room.ip);
-    auto selected_room=std::find_if(topology.begin(),topology.end(),[&](const sonos::Room& r){return r.id==command.room.id;});
-    if(selected_room==topology.end()) throw std::runtime_error("Selected room is unavailable");
-    Area area; area.name=command.name;
-    for(const auto& r:topology) if(r.coordinator==selected_room->coordinator) area.ids.push_back(r.id);
-    auto found=std::find_if(areas.begin(),areas.end(),[&](const Area& a){return a.name==area.name;});
-    size_t index=found==areas.end()?areas.size():static_cast<size_t>(found-areas.begin());
-    if(index>=8) throw std::runtime_error("Eight areas are saved. Reuse a name to replace one.");
-    std::string value=area.name;
-    for(const auto& id:area.ids) value+='\n'+id;
-    nvs_handle_t handle;
-    if(nvs_open("controller",NVS_READWRITE,&handle)!=ESP_OK) throw std::runtime_error("Cannot save area");
-    auto result=nvs_set_str(handle,("area"+std::to_string(index)).c_str(),value.c_str());
-    if(result==ESP_OK) result=nvs_commit(handle);
-    nvs_close(handle);
-    if(result!=ESP_OK) throw std::runtime_error("Area could not be saved");
-    if(index==areas.size()) areas.push_back(area); else areas[index]=area;
-    ui_areas(areas);
-    ui_toast("Saved "+area.name);
-}
 void save_settings(const Command& command) {
     nvs_handle_t handle;
     if(nvs_open("controller",NVS_READWRITE,&handle)!=ESP_OK) throw std::runtime_error("Cannot save Wi-Fi settings");
@@ -250,7 +217,6 @@ void worker(void*) {
         if(auto server=events_server()) { ota_register(server); debug_register(server); }
     }
     catch(const std::exception& e) { ui_toast(e.what(),true); ESP_LOGE(TAG,"Startup failed: %s",e.what()); }
-    load_areas(); ui_areas(areas);
     auto boot=new Command; boot->action="Connect"; boot->ssid=setting("ssid"); boot->password=setting("password"); boot->seed=setting("seed");
     if(!boot->ssid.empty()) submit(boot);
     else { delete boot; ui_toast(storage_ok?"Connect to your home Wi-Fi to find your speakers.":"Settings storage failed; settings will not be saved.",!storage_ok); }
@@ -339,13 +305,6 @@ void worker(void*) {
                 else if(a=="GroupVolume") client.volume(c->room,c->value,true);
                 else if(a=="Mute") client.mute(c->room,c->value);
                 else if(a=="GroupMute") client.mute(c->room,c->value,true);
-                else if(a=="SaveArea") save_area(*c);
-                else if(a=="Area" || a=="Group") {
-                    client.apply_area(seed,c->area_ids);
-                    push_rooms(client.rooms(seed)); ui_select(c->area_ids.front());
-                    if(a=="Area") ui_toast(c->name+" is grouped");
-                    last_rooms=0;
-                }
                 else if(a=="Wake") invalidate();
                 else if(a=="Event") {
                     event_pending=false;

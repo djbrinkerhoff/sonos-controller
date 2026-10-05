@@ -11,10 +11,9 @@ Running on the Tab5: Apple Music and Sonos Radio favorites, queue view, artwork,
 Implemented:
 
 - Favorites screen restricted to Apple Music and Sonos Radio using service IDs supplied by the household; unknown/conflicting providers are excluded.
-- Room selection, now-playing text, play/pause/stop, capability-gated previous/next, room mute, room and group volume.
-- Group/ungroup rooms and up to eight saved areas. Group the desired rooms, name the current group, and save it; apply a saved area to restore its membership.
+- Room selection on the Rooms tab (the selected card carries its volume slider), now-playing text, play/pause/stop, capability-gated previous/next, room mute, room and group volume. Grouping is left to the Sonos app; the controller follows whatever groups exist.
 - Speaker discovery by SSDP and mDNS together, remembered room IPs as a fallback, and an optional manual speaker IP.
-- On-device Wi-Fi setup, persistent settings and areas.
+- On-device Wi-Fi setup and persistent settings. Changing a saved network asks for a four-digit passcode, `CONFIG_TAB5_SETTINGS_PASSCODE` in menuconfig (default `1234`; set your own in `firmware/sdkconfig`).
 - Network work on a separate FreeRTOS task, bounded XML responses and paginated favorites, periodic state refresh, fresh coordinator lookup before group playback actions.
 - Favorite playback replaces the queue (like the official app's "Replace Queue") and starts it. Radio favorites use their supplied stream URI/metadata. A failed operation is not automatically replayed.
 - Read-only Python compatibility probe and host tests for the shared C++ Sonos protocol code.
@@ -59,8 +58,8 @@ The BSP auto-detects the supported display variants. Wi-Fi uses the internal C6 
 1. Connect the Tab5 USB-C device port with a data cable. Identify its serial port and P4 revision with the project environment's `python -m esptool --chip esp32p4 --port PORT chip_id`.
 2. Back up its current flash before the first write: `python -m esptool --chip esp32p4 --port PORT read_flash 0 0x1000000 artifacts/tab5-original.bin`. Run from the project root with the `.tools/espressif/python_env/.../bin` environment active. Keep that private backup.
 3. Select the matching chip-revision build, then use `bash tools/idf.sh -p PORT flash` for the default build (it writes the bootloader, partition table, OTA data and the app at 0x20000). After that, prefer `bash tools/ota.sh <tab5-ip>` (add the same `-B`/`-D` arguments for revision 3). Follow M5Stack's download-mode instructions if needed. Do not erase flash or replace the C6 firmware as a routine step.
-4. Open Settings, enter the 2.4 GHz Wi-Fi name/password, optionally enter one Sonos speaker's IP, and connect. Select a room before tapping a favorite. The selected room's current group is the playback destination.
-5. Verify one Apple Music favorite, one Radio favorite, transport controls, room/group volume, external Sonos-app changes, saved areas, reconnect behavior, and correct touch alignment. Use a low existing speaker volume for the first playback test.
+4. Open Settings, enter the 2.4 GHz Wi-Fi name/password, optionally enter one Sonos speaker's IP, and save. Select a room on the Rooms tab before tapping a favorite. The selected room's current group is the playback destination.
+5. Verify one Apple Music favorite, one Radio favorite, transport controls, room/group volume, external Sonos-app changes, reconnect behavior, and correct touch alignment. Use a low existing speaker volume for the first playback test.
 
 Build success alone does not verify board initialization or playback.
 

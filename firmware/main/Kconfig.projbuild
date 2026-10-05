@@ -35,6 +35,15 @@ config TAB5_DIM_PERCENT
     default 15
     range 1 100
 
+config TAB5_SETTINGS_PASSCODE
+    string "Passcode for changing Wi-Fi settings (four digits)"
+    default "1234"
+    help
+        Settings shows the saved network read-only; Edit asks for this
+        passcode before the Wi-Fi fields open. The build fails unless it is
+        exactly four digits. With no network saved yet, the fields open
+        without it.
+
 endmenu
 
 menu "Tab5 bring-up diagnostics"
@@ -57,7 +66,7 @@ config TAB5_FORGET_SPEAKERS
     help
         Erases the manual speaker IP and the saved room IPs on each boot,
         so the controller must find a speaker through SSDP discovery.
-        Wi-Fi credentials and saved areas are kept. Used to test discovery
+        Wi-Fi credentials are kept. Used to test discovery
         on hardware; flash the normal build afterwards.
 
 endmenu
