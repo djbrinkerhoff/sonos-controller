@@ -14,3 +14,9 @@ compiler=${CXX:-c++}
     "$root/tests/core_test.cpp" \
     -o "$tmp/core_test"
 "$tmp/core_test"
+"$compiler" -std=c++17 -Wall -Wextra -Werror \
+    -I"$root/firmware/main" \
+    "$root/firmware/main/battery_model.cpp" \
+    "$root/tests/battery_test.cpp" \
+    -o "$tmp/battery_test"
+"$tmp/battery_test"

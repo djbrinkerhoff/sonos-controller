@@ -1,4 +1,5 @@
 #include "power.hpp"
+#include "battery_model.hpp"
 #include "bsp/m5stack_tab5.h"
 #include "bmi270.h"
 #include "driver/i2c_master.h"
@@ -33,6 +34,15 @@ constexpr int I2C_TIMEOUT_MS=100;
 
 std::atomic<esp_io_expander_handle_t> expander{nullptr};
 std::atomic<i2c_master_dev_handle_t> ina226{nullptr};
+// Power measurements and standby switch the INA226 to shunt-only conversions;
+// a battery read in between would see a stale bus voltage (once, "no pack").
+SemaphoreHandle_t ina_lock=nullptr;
+struct InaLock {
+    InaLock() { if(ina_lock) xSemaphoreTake(ina_lock,portMAX_DELAY); }
+    ~InaLock() { if(ina_lock) xSemaphoreGive(ina_lock); }
+};
+BatteryModel model;
+std::atomic<bool> external_power{false};
 
 esp_err_t ina_write(uint8_t reg, uint16_t value) {
     auto dev=ina226.load();
@@ -50,6 +60,7 @@ esp_err_t ina_read(uint8_t reg, uint16_t* value) {
 }
 }
 void power_init() {
+    if(!ina_lock) ina_lock=xSemaphoreCreateMutex();
     if(esp_io_expander_handle_t io=bsp_io_expander1_init()) {
         expander=io;
         // Restore the charger pins the expander reset made inputs: charge
@@ -81,21 +92,37 @@ void power_init() {
 }
 Battery battery_read() {
     Battery battery;
-    uint16_t bus_raw, shunt_raw;
-    if(ina_read(REG_BUS,&bus_raw)!=ESP_OK || ina_read(REG_SHUNT,&shunt_raw)!=ESP_OK) return battery;
-    battery.pack_mv=bus_raw*5/4; // 1.25 mV LSB
-    if(battery.pack_mv<5000) return battery; // below the 2-cell minimum: no pack
-    battery.present=true;
-    battery.percent=std::clamp((battery.pack_mv/2-3300)*100/(4150-3300),0,100);
-    // Shunt LSB is 2.5 uV across 5 mOhm = 0.5 mA/LSB; M5Unified reports the
-    // charge current as the negated shunt current.
-    battery.current_ma=-static_cast<int16_t>(shunt_raw)/2;
+    // Three readings 30 ms apart (each already a 16 x 1.1 ms average) even
+    // out radio and backlight bursts.
+    int mv=0, ma=0;
+    {
+        InaLock lock;
+        for(int i=0;i<3;++i) {
+            if(i) vTaskDelay(pdMS_TO_TICKS(30));
+            uint16_t bus_raw, shunt_raw;
+            if(ina_read(REG_BUS,&bus_raw)!=ESP_OK || ina_read(REG_SHUNT,&shunt_raw)!=ESP_OK) return battery;
+            mv+=bus_raw*5/4;  // 1.25 mV LSB
+            // Shunt LSB is 2.5 uV across 5 mOhm = 0.5 mA/LSB; M5Unified reports
+            // the charge current as the negated shunt current.
+            ma+=-static_cast<int16_t>(shunt_raw)/2;
+        }
+    }
+    battery.valid=true;
+    battery.pack_mv=mv/3; battery.current_ma=ma/3;
+    battery.present=model.update({battery.pack_mv,battery.current_ma});
     // CHG_STAT reads high on battery alone as well (measured: high while the
-    // pack discharged 136 mA), so the current's direction decides.
-    battery.charging=battery.current_ma>20;
+    // pack discharged 136 mA), so the current's direction decides. On battery
+    // the device always draws 38 mA or more, so about 0 mA means USB power.
+    const auto source=BatteryModel::source_for({battery.pack_mv,battery.current_ma});
+    battery.charging=source==PowerSource::Charging;
+    battery.external=!battery.present || source==PowerSource::External;
+    battery.percent=battery.present?model.percent():0;
+    external_power=battery.charging || battery.external;
     return battery;
 }
+bool power_external() { return external_power.load(); }
 int power_measure_ma(int seconds, int* low, int* high) {
+    InaLock lock;
     // Shunt only, 128 x 1.1 ms: back-to-back conversions cover the whole
     // window, so short radio bursts are counted in the average.
     if(ina_write(REG_CONFIG,0x4925)!=ESP_OK) return 0;
@@ -126,6 +153,7 @@ SemaphoreHandle_t standby_done=nullptr;
 // C6 cannot reach a sleeping host. Measured 54 mA at the pack, against 80 mA
 // awake at 40 MHz with the radio in modem sleep.
 const char* run_standby(bmi270_handle_t* imu) {
+    InaLock lock;  // shunt-only conversions for the whole standby
     float bx=0,by=0,bz=0;
     if(bmi270_get_acce_data(imu,&bx,&by,&bz)!=ESP_OK) return "imu unavailable";
     // ST712x INT idles high; wake on it only if it is not already asserted.

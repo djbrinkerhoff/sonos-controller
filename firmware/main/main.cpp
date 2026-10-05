@@ -238,6 +238,7 @@ void worker(void*) {
     unsigned art_sent=0; TickType_t art_next_try=0; bool art_done=false;
     std::vector<EventTarget> subscribed; TickType_t subscribed_at=0;
     bool was_online=false, radio_saving=false;
+    Battery last_logged; TickType_t battery_logged_at=0;
     // Standby follows CONFIG_TAB5_STANDBY_MINUTES with the screen off and the
     // selected room not playing. Unknown counts as playing.
     bool playing=true; TickType_t quiet_since=0, last_playing_check=0;
@@ -265,7 +266,8 @@ void worker(void*) {
             if(screen_off()!=radio_saving) { radio_saving=!radio_saving; network_power_save(radio_saving); }
             if(!screen_off() || playing) quiet_since=0;
             else if(!quiet_since) quiet_since=xTaskGetTickCount();
-            if(!c && quiet_since && CONFIG_TAB5_STANDBY_MINUTES>0 && display_asleep() &&
+            // On USB power standby saves nothing and costs a slow, motion-only wake.
+            if(!c && quiet_since && CONFIG_TAB5_STANDBY_MINUTES>0 && display_asleep() && !power_external() &&
                xTaskGetTickCount()-quiet_since>=pdMS_TO_TICKS(CONFIG_TAB5_STANDBY_MINUTES*60000)) {
                 ESP_LOGI(TAG,"Nothing playing for %d minutes; standby",CONFIG_TAB5_STANDBY_MINUTES);
                 network_suspend();
@@ -275,6 +277,7 @@ void worker(void*) {
                 // Taps queue meanwhile; polling before the network is back would only fail.
                 for(int i=0;i<150 && !network_online();++i) vTaskDelay(pdMS_TO_TICKS(100));
                 quiet_since=0; playing=true;
+                last_battery=0;           // the header has not updated through standby
                 subscribed.clear();       // subscriptions lapsed while offline
                 invalidate();
                 next_poll=0;
@@ -331,12 +334,21 @@ void worker(void*) {
                 else if(a!="Poll") client.transport(c->room,a);
                 failures=0;  // a successful command proves the speakers are reachable
             }
-            if(!last_battery || xTaskGetTickCount()-last_battery>pdMS_TO_TICKS(30000)) {
+            // Every 10 s (two cheap I2C reads, smoothed), so plugging in shows
+            // promptly; logged on a change of source or every 5 minutes, since
+            // the log ring is small.
+            if(!last_battery || xTaskGetTickCount()-last_battery>pdMS_TO_TICKS(10000)) {
                 last_battery=xTaskGetTickCount();
                 const auto battery=battery_read();
-                ui_battery(battery);
-                ESP_LOGI(TAG,"Battery: %s %d mV %d%% %d mA%s",battery.present?"present":"absent",battery.pack_mv,
-                         battery.percent,battery.current_ma,battery.charging?" charging":"");
+                if(battery.valid) {
+                    ui_battery(battery);
+                    if(!battery_logged_at || battery.charging!=last_logged.charging || battery.external!=last_logged.external ||
+                       xTaskGetTickCount()-battery_logged_at>pdMS_TO_TICKS(300000)) {
+                        ESP_LOGI(TAG,"Battery: %s %d mV %d%% %d mA%s",battery.present?"present":"absent",battery.pack_mv,battery.percent,
+                                 battery.current_ma,battery.charging?" charging":battery.external?" on USB power":"");
+                        last_logged=battery; battery_logged_at=xTaskGetTickCount();
+                    }
+                }
             }
             // External regrouping is picked up within 30 s even without events.
             if(xTaskGetTickCount()-last_topology>pdMS_TO_TICKS(30000)) {

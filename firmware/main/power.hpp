@@ -7,13 +7,19 @@
 void power_init();
 
 struct Battery {
+    bool valid = false;     // false: the monitor could not be read; keep the last reading
     bool present = false;
     int pack_mv = 0;
-    int percent = 0;
-    int current_ma = 0;  // positive while charging (M5Unified convention)
+    int percent = 0;        // load-corrected and smoothed (battery_model.hpp)
+    int current_ma = 0;     // positive while charging (M5Unified convention)
     bool charging = false;  // current flowing into the pack
+    bool external = false;  // on USB power with the charger idle: full, or no pack
 };
 Battery battery_read();
+// On USB power (charging or full), from the latest battery_read(). Screen-off
+// tiers that only motion can wake are skipped then: a docked Tab5 should
+// still answer a tap.
+bool power_external();
 // Mean pack discharge current (mA) over the window, for power measurements.
 int power_measure_ma(int seconds, int* low = nullptr, int* high = nullptr);
 

@@ -26,6 +26,8 @@ void set_level(Level next) {
     // touch controller stops scanning too). With no working motion sensor
     // there would be no way back, so the display stays touch-wakeable.
     if(next==Level::Deep && !motion_active()) next=Level::Off;
+    // On USB power (docked) stay tap-wakeable: the battery is not draining.
+    if(next==Level::Deep && power_external()) next=Level::Off;
     const Level was=level.exchange(next);
     if(was==next) return;
     const int percent=next==Level::Awake?100:next==Level::Dim?CONFIG_TAB5_DIM_PERCENT:0;
@@ -44,6 +46,8 @@ int64_t forced_at=0;  // debug: esp_timer time of a forced screen-off
 void tick(lv_timer_t*) {
     int64_t idle_ms=lv_display_get_inactive_time(nullptr);
     if(auto moved=last_motion.load()) idle_ms=std::min<int64_t>(idle_ms,(esp_timer_get_time()-moved)/1000);
+    // Plugged in while the display sleeps: wake it to "off" so taps work again.
+    if(level==Level::Deep && power_external() && !forced_at) set_level(Level::Off);
     if(forced_at) {
         // Stay off until a touch or motion newer than the forced off.
         if(idle_ms>=(esp_timer_get_time()-forced_at)/1000) return;

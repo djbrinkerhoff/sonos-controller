@@ -748,8 +748,10 @@ void render_device_info() {
     std::string info;
     if(battery_known) {
         char b[96];
-        if(battery.present) snprintf(b,sizeof b,"Battery  %d%%  (%.2f V%s)\n",battery.percent,battery.pack_mv/1000.0,battery.charging?", charging":"");
-        else snprintf(b,sizeof b,"Battery  not detected\n");
+        if(!battery.present) snprintf(b,sizeof b,"Battery  not detected\n");
+        else if(battery.charging) snprintf(b,sizeof b,"Battery  %d%%  (charging, %.1f A)\n",battery.percent,battery.current_ma/1000.0);
+        else if(battery.external) snprintf(b,sizeof b,"Battery  %d%%  (on USB power)\n",battery.percent);
+        else snprintf(b,sizeof b,"Battery  %d%%  (%.2f V, %d mA)\n",battery.percent,battery.pack_mv/1000.0,-battery.current_ma);
         info+=b;
     }
     esp_netif_ip_info_t ip{}; char address[16]="-";
@@ -965,11 +967,18 @@ void ui_levels(const std::vector<std::pair<std::string,sonos::Level>>& by_room) 
 void ui_battery(const Battery& b) {
     DisplayLock lock;
     battery=b; battery_known=true;
+    if(view==View::Settings) render_device_info();
     if(!b.present) { lv_label_set_text_fmt(battery_label,"%s  Powered",LV_SYMBOL_USB); return; }
+    const bool plugged=b.charging || b.external;
     const char* symbol=b.percent>85?LV_SYMBOL_BATTERY_FULL:b.percent>60?LV_SYMBOL_BATTERY_3:
                        b.percent>35?LV_SYMBOL_BATTERY_2:b.percent>10?LV_SYMBOL_BATTERY_1:LV_SYMBOL_BATTERY_EMPTY;
-    lv_label_set_text_fmt(battery_label,"%s%s  %d%%",b.charging?LV_SYMBOL_CHARGE "  ":"",symbol,b.percent);
-    lv_obj_set_style_text_color(battery_label,c(b.percent<=10 && !b.charging?ink::danger:ink::muted),0);
+    lv_label_set_text_fmt(battery_label,"%s%s  %d%%",plugged?LV_SYMBOL_CHARGE "  ":"",symbol,b.percent);
+    lv_obj_set_style_text_color(battery_label,c(b.percent<=10 && !plugged?ink::danger:ink::muted),0);
+    // Warn once at 15% and once at 5% on battery; plugging in re-arms both.
+    static int warned_at=101;
+    if(plugged) warned_at=101;
+    else if(b.percent<=5 && warned_at>5) { warned_at=5; ui_toast("Battery at 5%. Plug in the controller.",true); }
+    else if(b.percent<=15 && warned_at>15) { warned_at=15; ui_toast("Battery low (15%)"); }
 }
 void ui_online(bool now_online) { DisplayLock lock; online=now_online; lv_obj_set_flag(offline_label,LV_OBJ_FLAG_HIDDEN,online); }
 void ui_toast(const std::string& message,bool error) {
