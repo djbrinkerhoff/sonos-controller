@@ -219,7 +219,7 @@ Fields Client::call(const std::string& ip, const std::string& service, const std
     urn = std::string("urn:") + (rincon ? "schemas-rinconnetworks-com" : "schemas-upnp-org") + ":service:" + service + ":1";
     std::string body = "<?xml version=\"1.0\"?><s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\"><s:Body><u:" + action + " xmlns:u=\"" + urn + "\">";
     // UPnP devices can require argument order; maps are not used for serialization order.
-    const std::vector<std::string> order = {"InstanceID","Channel","ObjectID","BrowseFlag","Filter","StartingIndex","RequestedCount","SortCriteria","CurrentURI","CurrentURIMetaData","EnqueuedURI","EnqueuedURIMetaData","DesiredFirstTrackNumberEnqueued","EnqueueAsNext","Unit","Target","Speed","DesiredVolume","DesiredMute"};
+    const std::vector<std::string> order = {"InstanceID","Channel","ObjectID","BrowseFlag","Filter","StartingIndex","RequestedCount","SortCriteria","CurrentURI","CurrentURIMetaData","EnqueuedURI","EnqueuedURIMetaData","DesiredFirstTrackNumberEnqueued","EnqueueAsNext","Unit","Target","Speed","DesiredVolume","DesiredMute","NewCoordinator","RejoinGroup"};
     size_t count = 0;
     for (const auto& key : order) if (auto it = fields.find(key); it != fields.end()) {
         body += "<" + key + ">" + escape(it->second) + "</" + key + ">";
@@ -376,6 +376,26 @@ void Client::join(const Room& room, const Room& destination) {
 void Client::ungroup(const Room& room) {
     invalidate_topology();
     call(room.ip,"AVTransport","BecomeCoordinatorOfStandaloneGroup",{{"InstanceID","0"}});
+}
+void Client::leave(const Room& room) {
+    const auto all=rooms(room.ip);
+    auto self=std::find_if(all.begin(),all.end(),[&](const Room& r){return r.id==room.id;});
+    if(self==all.end()) throw std::runtime_error("Room is no longer available");
+    auto heir=std::find_if(all.begin(),all.end(),[&](const Room& r){return r.id!=self->id && r.coordinator==self->coordinator;});
+    if(heir==all.end()) return;  // alone already
+    if(self->coordinator==self->id) {
+        try {
+            invalidate_topology();
+            call(self->ip,"AVTransport","DelegateGroupCoordinationTo",{{"InstanceID","0"},{"NewCoordinator",heir->id},{"RejoinGroup","0"}});
+            return;
+        } catch (const std::exception&) {}  // older firmware: fall back to splitting off
+    }
+    ungroup(*self);
+}
+Level Client::level(const Room& room) {
+    auto v=call(room.ip,"RenderingControl","GetVolume",{{"InstanceID","0"},{"Channel","Master"}});
+    auto m=call(room.ip,"RenderingControl","GetMute",{{"InstanceID","0"},{"Channel","Master"}});
+    return {number(v.at("CurrentVolume"),100), m["CurrentMute"]=="1"};
 }
 void Client::apply_area(const std::string& seed, const std::vector<std::string>& ids) {
     if(ids.empty() || ids.size()>32) throw std::runtime_error("Invalid saved area");

@@ -315,6 +315,8 @@ void worker(void*) {
                     client.volume(c->room,c->value,group);  // level first, so unmuting never plays the old one
                     if(c->unmute) client.mute(c->room,false,group);
                 }
+                else if(a=="Join") { client.join(c->target,c->room); invalidate(); last_rooms=0; }
+                else if(a=="Leave") { client.leave(c->target); invalidate(); last_rooms=0; }
                 else if(a=="Mute") client.mute(c->room,c->value);
                 else if(a=="GroupMute") client.mute(c->room,c->value,true);
                 else if(a=="Wake") invalidate();
@@ -405,6 +407,15 @@ void worker(void*) {
                     catch(const std::exception& e) { ESP_LOGW(TAG,"Summary for %s: %s",r.name.c_str(),e.what()); }
                 }
                 ui_summaries(summaries);
+                // The selected group's cards each carry that room's own volume.
+                std::vector<std::pair<std::string,sonos::Level>> levels;
+                const auto self=std::find_if(all.begin(),all.end(),[&](const sonos::Room& r){ return r.id==target.id; });
+                if(self!=all.end()) for(const auto& r:all) if(r.coordinator==self->coordinator) {
+                    if(uxQueueMessagesWaiting(commands)) break;
+                    try { levels.emplace_back(r.id,client.level(r)); }
+                    catch(const std::exception& e) { ESP_LOGW(TAG,"Volume of %s: %s",r.name.c_str(),e.what()); }
+                }
+                ui_levels(levels);
             }
             // Favorites change through the Sonos app too: recheck on content
             // events and every 30 minutes, pushing only real changes.

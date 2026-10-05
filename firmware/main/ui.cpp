@@ -200,7 +200,17 @@ struct Tile {
 std::vector<Tile> tiles;
 // Queue, Rooms, Settings
 lv_obj_t *queue_list,*queue_header;
-lv_obj_t *room_grid,*room_volume;  // room_volume: the slider on the selected room's card, if shown
+lv_obj_t* room_grid;
+// One card per room, built when the room list changes and otherwise updated in
+// place: rebuilding on every tap or poll deleted cards under a finger and
+// dropped quick taps.
+struct RoomCard { lv_obj_t *card=nullptr,*name=nullptr,*detail=nullptr,*mates=nullptr,*badge=nullptr,*slider=nullptr; };
+std::vector<RoomCard> room_cards;
+std::map<std::string,sonos::Level> levels;  // each room's own volume, when known
+// Join/Leave sent but not yet seen in the topology: the card shows the
+// intended state until it is, or for 10 s if the speakers never confirm it.
+struct Pending { bool join; int64_t at; };
+std::map<std::string,Pending> pending;
 lv_obj_t *ssid_input,*password_input,*seed_input,*device_info;
 // Settings shows the saved network; Edit asks for the passcode, then opens the form.
 enum class SettingsMode { Summary, Passcode, Form };
@@ -258,39 +268,77 @@ bool grouped() { return group_of(selected).size()>1; }
 bool muted_now() { return grouped()?current.group_muted:current.muted; }
 // Muted reads as zero on every volume bar; unmuting puts the real level back.
 int shown_volume() { return muted_now()?0:grouped()?current.group_volume:current.volume; }
+int shown_level(const sonos::Level& l) { return l.muted?0:l.volume; }
+bool any_slider_pressed() {
+    if(lv_obj_has_state(np_volume,LV_STATE_PRESSED)) return true;
+    for(auto& rc:room_cards) if(lv_obj_has_state(rc.slider,LV_STATE_PRESSED)) return true;
+    return false;
+}
+// Room cards: each selected room's own level; hidden until it is known, so a
+// newly selected room never flashes an empty bar.
+void render_card_sliders() {
+    for(size_t i=0;i<room_cards.size() && i<rooms.size();++i) {
+        auto slider=room_cards[i].slider;
+        if(lv_obj_has_flag(slider,LV_OBJ_FLAG_HIDDEN) || lv_obj_has_state(slider,LV_STATE_PRESSED)) continue;
+        if(auto it=levels.find(rooms[i].id); it!=levels.end()) lv_slider_set_value(slider,shown_level(it->second),LV_ANIM_OFF);
+    }
+}
 void render_volume() {
     set_icon(np_mute,muted_now()?LV_SYMBOL_MUTE:LV_SYMBOL_VOLUME_MAX);
-    const bool dragging=lv_obj_has_state(np_volume,LV_STATE_PRESSED) || (room_volume && lv_obj_has_state(room_volume,LV_STATE_PRESSED));
-    if(dragging) return;
+    if(any_slider_pressed()) return;
     const int level=shown_volume();
     lv_slider_set_value(np_volume,level,LV_ANIM_OFF);
-    if(room_volume) lv_slider_set_value(room_volume,level,LV_ANIM_OFF);
     lv_label_set_text_fmt(np_volume_value,"%d",level);
+    render_card_sliders();
 }
 void mute_clicked(lv_event_t*) {
     if(selected.id.empty()) return;
     const bool muted=muted_now();
     auto k=for_room(grouped()?"GroupMute":"Mute"); k->value=!muted; send(k);
-    if(grouped()) current.group_muted=!muted; else current.muted=!muted;
+    if(grouped()) {  // group mute mutes every member
+        current.group_muted=!muted;
+        for(auto* r:group_of(selected)) if(auto it=levels.find(r->id); it!=levels.end()) it->second.muted=!muted;
+    } else {
+        current.muted=!muted;
+        if(auto it=levels.find(selected.id); it!=levels.end()) it->second.muted=!muted;
+    }
     render_volume();
 }
-// Now Playing and the selected room's card each have a volume slider; dragging
-// either moves the other, and releasing sends the level.
+lv_obj_t* card_slider(const std::string& room_id) {
+    for(size_t i=0;i<room_cards.size() && i<rooms.size();++i) if(rooms[i].id==room_id) return room_cards[i].slider;
+    return nullptr;
+}
+// Now Playing's slider: the group's volume when grouped, else the room's (and
+// then its card moves with it). Releasing sends the level.
 void volume_event(lv_event_t* e) {
-    auto slider=lv_event_get_target_obj(e);
-    const int value=lv_slider_get_value(slider);
+    const int value=lv_slider_get_value(np_volume);
     lv_label_set_text_fmt(np_volume_value,"%d",value);
-    if(slider!=np_volume) lv_slider_set_value(np_volume,value,LV_ANIM_OFF);
-    if(room_volume && slider!=room_volume) lv_slider_set_value(room_volume,value,LV_ANIM_OFF);
+    if(!grouped()) if(auto s=card_slider(selected.id)) lv_slider_set_value(s,value,LV_ANIM_OFF);
     if(lv_event_get_code(e)==LV_EVENT_RELEASED && !selected.id.empty()) {
         // Setting a level while muted unmutes, as in the Sonos app.
         auto k=for_room(grouped()?"GroupVolume":"Volume"); k->value=value; k->unmute=muted_now(); send(k);
         if(grouped()) { current.group_volume=value; current.group_muted=false; }
-        else { current.volume=value; current.muted=false; }
+        else { current.volume=value; current.muted=false; levels[selected.id]={value,false}; }
         render_volume();
     }
 }
-lv_obj_t* volume_slider(lv_obj_t* parent,int width) {
+// A room card's slider: that room's own volume, grouped or not.
+void card_volume_event(lv_event_t* e) {
+    const auto index=reinterpret_cast<uintptr_t>(lv_event_get_user_data(e));
+    if(index>=rooms.size()) return;
+    const auto room=rooms[index];
+    const int value=lv_slider_get_value(room_cards[index].slider);
+    const bool solo=room.id==selected.id && !grouped();
+    if(solo) { lv_slider_set_value(np_volume,value,LV_ANIM_OFF); lv_label_set_text_fmt(np_volume_value,"%d",value); }
+    if(lv_event_get_code(e)==LV_EVENT_RELEASED) {
+        auto it=levels.find(room.id);
+        auto k=new Command; k->action="Volume"; k->room=room; k->value=value; k->unmute=it!=levels.end() && it->second.muted; send(k);
+        levels[room.id]={value,false};
+        if(room.id==selected.id) { current.volume=value; current.muted=false; }
+        render_volume();
+    }
+}
+lv_obj_t* volume_slider(lv_obj_t* parent,int width,lv_event_cb_t cb=volume_event,void* data=nullptr) {
     // A thick bar-style slider: the whole 56 px track is the target, no thin knob.
     auto s=lv_slider_create(parent); lv_obj_set_size(s,width,56);
     lv_slider_set_range(s,0,100);
@@ -300,8 +348,8 @@ lv_obj_t* volume_slider(lv_obj_t* parent,int width) {
     lv_obj_set_style_bg_opa(s,LV_OPA_TRANSP,LV_PART_KNOB); lv_obj_set_style_pad_all(s,0,LV_PART_KNOB);
     lv_obj_set_style_shadow_width(s,0,LV_PART_KNOB);
     lv_obj_set_ext_click_area(s,16);
-    lv_obj_add_event_cb(s,volume_event,LV_EVENT_VALUE_CHANGED,nullptr);
-    lv_obj_add_event_cb(s,volume_event,LV_EVENT_RELEASED,nullptr);
+    lv_obj_add_event_cb(s,cb,LV_EVENT_VALUE_CHANGED,data);
+    lv_obj_add_event_cb(s,cb,LV_EVENT_RELEASED,data);
     return s;
 }
 void empty_clicked(lv_event_t*) { show_view(selected.id.empty()?View::Rooms:View::Favorites); }
@@ -557,62 +605,83 @@ void build_queue(lv_obj_t* v) {
 }
 
 // ---- Rooms ------------------------------------------------------------------------------
-// Tapping a card selects that room and stays here: the selected card carries
-// the volume slider, and the rail leads on to Now Playing.
+// The highlighted cards are the selected room's Sonos group. Tapping another
+// room joins it to that music; tapping a highlighted one takes it out (it
+// stops). One room always stays selected, so there is something to control.
+constexpr int ROOM_COLUMNS=2, ROOM_GAP=24, ROOM_CARD_W=(CONTENT_W-2*PAD-(ROOM_COLUMNS-1)*ROOM_GAP)/ROOM_COLUMNS, ROOM_CARD_H=204;
+constexpr int64_t PENDING_US=10*1000000LL;
+bool in_group(const sonos::Room& r) { return !selected.coordinator.empty() && r.coordinator==selected.coordinator; }
+bool shown_selected(const sonos::Room& r) {
+    if(auto p=pending.find(r.id); p!=pending.end()) return p->second.join;
+    return in_group(r);
+}
+void render_rooms() {
+    if(!room_grid || room_cards.size()!=rooms.size()) return;
+    const int64_t now=esp_timer_get_time();
+    for(auto p=pending.begin();p!=pending.end();) p=now-p->second.at>PENDING_US?pending.erase(p):std::next(p);
+    for(size_t i=0;i<rooms.size();++i) {
+        const auto& r=rooms[i]; auto& rc=room_cards[i];
+        const bool on=shown_selected(r);
+        lv_obj_set_style_border_color(rc.card,c(on?ink::accent:ink::surface),0);
+        auto it=summaries.find(r.coordinator);
+        const bool playing=it!=summaries.end() && it->second.playback=="PLAYING";
+        const std::string line=it==summaries.end()?"":it->second.title.empty()?"Nothing playing":it->second.title+(it->second.artist.empty()?"":" · "+it->second.artist);
+        lv_label_set_text(rc.detail,line.c_str());
+        lv_obj_set_style_text_color(rc.detail,c(playing?ink::muted:ink::faint),0);
+        lv_obj_set_flag(rc.badge,LV_OBJ_FLAG_HIDDEN,!playing);
+        const bool level_known=levels.count(r.id)>0;
+        if(on) {  // track line under the name, the room's own volume along the bottom
+            lv_obj_align(rc.detail,LV_ALIGN_TOP_LEFT,0,52);
+            lv_obj_add_flag(rc.mates,LV_OBJ_FLAG_HIDDEN);
+            lv_obj_set_flag(rc.slider,LV_OBJ_FLAG_HIDDEN,!level_known);
+        } else {
+            lv_obj_align(rc.detail,LV_ALIGN_BOTTOM_LEFT,0,0);
+            lv_obj_add_flag(rc.slider,LV_OBJ_FLAG_HIDDEN);
+            size_t mates=0; for(auto& o:rooms) if(o.coordinator==r.coordinator && o.id!=r.id) ++mates;
+            if(mates) lv_label_set_text_fmt(rc.mates,"%s  with %u more",ICON_LINK,static_cast<unsigned>(mates));
+            lv_obj_set_flag(rc.mates,LV_OBJ_FLAG_HIDDEN,mates==0);
+        }
+    }
+    render_card_sliders();
+}
 void room_clicked(lv_event_t* e) {
     const auto index=reinterpret_cast<uintptr_t>(lv_event_get_user_data(e));
     if(index>=rooms.size()) return;
-    ui_select(rooms[index].id);
-    auto k=for_room("Poll"); submit(k);
+    const auto room=rooms[index];
+    if(selected.id.empty()) { ui_select(room.id); submit(for_room("Poll")); return; }
+    size_t chosen=0; for(auto& r:rooms) if(shown_selected(r)) ++chosen;
+    const bool on=shown_selected(room);
+    if(on && chosen<=1) { ui_toast("One room stays selected. Tap another room first."); return; }
+    auto k=new Command; k->action=on?"Leave":"Join"; k->room=selected; k->target=room;
+    if(!submit(k)) { ui_toast("Still working on the last request. Try again.",true); return; }
+    pending[room.id]={!on,esp_timer_get_time()};
+    if(on && room.id==selected.id)  // control moves to a room that stays
+        for(auto& r:rooms) if(r.id!=room.id && shown_selected(r)) { ui_select(r.id); break; }
+    render_rooms();
 }
-void render_rooms() {
-    if(!room_grid) return;
-    // A rebuild would delete the slider out from under a finger.
-    if(room_volume && lv_obj_has_state(room_volume,LV_STATE_PRESSED)) return;
-    lv_obj_clean(room_grid); room_volume=nullptr;
-    constexpr int columns=2, gap=24, card_w=(CONTENT_W-2*PAD-(columns-1)*gap)/columns, card_h=204;
+void build_room_cards() {
+    lv_obj_clean(room_grid); room_cards.clear();
     for(size_t i=0;i<rooms.size();++i) {
-        const auto& r=rooms[i];
-        const bool is_selected=r.id==selected.id;
-        auto card=tappable(room_grid,card_w,card_h,ink::surface,ink::pressed,20,room_clicked,reinterpret_cast<void*>(i));
-        lv_obj_set_style_pad_all(card,21,0);  // + the 3 px border every card has, so text lines up
-        lv_obj_set_style_border_width(card,3,0);
-        lv_obj_set_style_border_color(card,c(is_selected?ink::accent:ink::surface),0);
-        auto name=one_line(text(card,&font_body_32,ink::text,r.name.c_str()),card_w-48-56);
-        lv_obj_align(name,LV_ALIGN_TOP_LEFT,0,0);
-        auto it=summaries.find(r.coordinator);
-        const bool playing=it!=summaries.end() && it->second.playback=="PLAYING";
-        std::string line=it==summaries.end()?"":it->second.title.empty()?"Nothing playing":it->second.title+(it->second.artist.empty()?"":" · "+it->second.artist);
-        auto detail=one_line(text(card,&font_caption_22,playing?ink::muted:ink::faint,line.c_str()),card_w-48);
-        size_t mates=0; for(auto& o:rooms) if(o.coordinator==r.coordinator && o.id!=r.id) ++mates;
-        if(is_selected) {
-            // Track line under the name, volume along the bottom.
-            lv_obj_align(detail,LV_ALIGN_TOP_LEFT,0,52);
-            room_volume=volume_slider(card,card_w-48);
-            lv_obj_align(room_volume,LV_ALIGN_BOTTOM_LEFT,0,0);
-            lv_slider_set_value(room_volume,shown_volume(),LV_ANIM_OFF);
-        } else {
-            lv_obj_align(detail,LV_ALIGN_BOTTOM_LEFT,0,0);
-            if(mates) {
-                auto g=text(card,&font_caption_22,ink::muted,""); lv_label_set_text_fmt(g,"%s  with %u more",ICON_LINK,static_cast<unsigned>(mates));
-                lv_obj_align(g,LV_ALIGN_LEFT_MID,0,6);
-            }
-        }
-        if(playing) { auto b=text(card,&font_body_32,ink::accent,LV_SYMBOL_VOLUME_MAX); lv_obj_align(b,LV_ALIGN_TOP_RIGHT,0,0); }
+        RoomCard rc;
+        rc.card=tappable(room_grid,ROOM_CARD_W,ROOM_CARD_H,ink::surface,ink::pressed,20,room_clicked,reinterpret_cast<void*>(i));
+        lv_obj_set_style_pad_all(rc.card,21,0);  // + the 3 px border every card has, so text lines up
+        lv_obj_set_style_border_width(rc.card,3,0);
+        rc.name=one_line(text(rc.card,&font_body_32,ink::text,rooms[i].name.c_str()),ROOM_CARD_W-48-56);
+        lv_obj_align(rc.name,LV_ALIGN_TOP_LEFT,0,0);
+        rc.detail=one_line(text(rc.card,&font_caption_22,ink::faint),ROOM_CARD_W-48);
+        rc.mates=text(rc.card,&font_caption_22,ink::muted); lv_obj_align(rc.mates,LV_ALIGN_LEFT_MID,0,6);
+        rc.badge=text(rc.card,&font_body_32,ink::accent,LV_SYMBOL_VOLUME_MAX); lv_obj_align(rc.badge,LV_ALIGN_TOP_RIGHT,0,0);
+        rc.slider=volume_slider(rc.card,ROOM_CARD_W-48,card_volume_event,reinterpret_cast<void*>(i));
+        lv_obj_align(rc.slider,LV_ALIGN_BOTTOM_LEFT,0,0);
+        lv_obj_add_flag(rc.slider,LV_OBJ_FLAG_HIDDEN);
+        room_cards.push_back(rc);
     }
-}
-// Selecting a room from its own card must not delete that card mid-event, so
-// the rebuild runs on the next LVGL tick; repeated requests collapse into one.
-bool rooms_render_queued=false;
-void render_rooms_soon() {
-    if(rooms_render_queued) return;
-    rooms_render_queued=true;
-    lv_async_call([](void*){ rooms_render_queued=false; render_rooms(); },nullptr);
+    render_rooms();
 }
 void build_rooms(lv_obj_t* v) {
     lv_obj_set_style_pad_all(v,PAD,0); lv_obj_set_style_pad_top(v,24,0);
-    room_grid=row(v,24); lv_obj_set_width(room_grid,CONTENT_W-2*PAD); lv_obj_set_height(room_grid,LV_SIZE_CONTENT);
-    lv_obj_set_flex_flow(room_grid,LV_FLEX_FLOW_ROW_WRAP); lv_obj_set_style_pad_row(room_grid,24,0);
+    room_grid=row(v,ROOM_GAP); lv_obj_set_width(room_grid,CONTENT_W-2*PAD); lv_obj_set_height(room_grid,LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(room_grid,LV_FLEX_FLOW_ROW_WRAP); lv_obj_set_style_pad_row(room_grid,ROOM_GAP,0);
 }
 
 // ---- Settings -----------------------------------------------------------------------
@@ -819,7 +888,7 @@ void ui_select(const std::string& id) {
     if(it==rooms.end() || it->id==selected.id) return;
     selected=*it; have_state=false; current={};
     now_art.set(Artwork{});
-    render_rooms_soon(); render_now_playing();
+    render_rooms(); render_now_playing();
 }
 void ui_rooms(const std::vector<sonos::Room>& fresh) {
     DisplayLock lock;
@@ -831,7 +900,16 @@ void ui_rooms(const std::vector<sonos::Room>& fresh) {
         selected=preferred!=rooms.end()?*preferred:rooms.front(); have_state=false; current={};
     }
     else selected={};
-    render_rooms(); render_now_playing();
+    // A Join/Leave the topology now shows is done.
+    for(auto p=pending.begin();p!=pending.end();) {
+        auto r=std::find_if(rooms.begin(),rooms.end(),[&](const sonos::Room& x){ return x.id==p->first; });
+        p=(r==rooms.end() || in_group(*r)==p->second.join)?pending.erase(p):std::next(p);
+    }
+    // Rooms come sorted by name, so only a new or missing room means new cards.
+    bool same=room_cards.size()==rooms.size();
+    for(size_t i=0;same && i<rooms.size();++i) same=lv_label_get_text(room_cards[i].name)==rooms[i].name;
+    if(same) render_rooms(); else build_room_cards();
+    render_now_playing();
 }
 void ui_favorites(const std::vector<sonos::Favorite>& fresh) { DisplayLock lock; favorites=fresh; render_favorites(); }
 // id+index together identify the tile, so a cover fetched for an older
@@ -849,6 +927,8 @@ void ui_state(const sonos::Room& room,const sonos::State& state) {
     DisplayLock lock;
     if(room.id!=selected.id) return;
     current=state; have_state=true; position_at=esp_timer_get_time();
+    levels[room.id]={state.volume,state.muted};
+    if(view==View::Rooms) render_rooms();
     render_now_playing();
 }
 void ui_artwork(const sonos::Room& room,Artwork art) { DisplayLock lock; if(room.id==selected.id) now_art.set(std::move(art)); }
@@ -875,6 +955,11 @@ void ui_summaries(const std::vector<std::pair<std::string,sonos::Summary>>& by_c
     DisplayLock lock;
     summaries.clear();
     for(auto& [id,s]:by_coordinator) summaries[id]=s;
+    if(view==View::Rooms) render_rooms();
+}
+void ui_levels(const std::vector<std::pair<std::string,sonos::Level>>& by_room) {
+    DisplayLock lock;
+    for(auto& [id,l]:by_room) levels[id]=l;
     if(view==View::Rooms) render_rooms();
 }
 void ui_battery(const Battery& b) {

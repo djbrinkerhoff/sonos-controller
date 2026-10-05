@@ -34,6 +34,8 @@ void ui_state(const sonos::Room& room, const sonos::State& state);
 void ui_artwork(const sonos::Room& room, Artwork art);
 void ui_queue(const sonos::Room& room, const std::vector<sonos::QueueItem>& items, int total, int track);
 void ui_summaries(const std::vector<std::pair<std::string, sonos::Summary>>& by_coordinator);
+// Each room's own volume, for the cards of the rooms grouped with the selection.
+void ui_levels(const std::vector<std::pair<std::string, sonos::Level>>& by_room);
 void ui_battery(const Battery& battery);
 void ui_online(bool online);
 void ui_toast(const std::string& text, bool error = false);

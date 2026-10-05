@@ -26,6 +26,8 @@ struct State {
 };
 // What a group is playing, for room overviews: two calls instead of state()'s six.
 struct Summary { std::string title, artist, playback; };
+// One room's own volume, as opposed to its group's.
+struct Level { int volume = 0; bool muted = false; };
 // Thrown by multi-request reads when the callback given to set_interrupt()
 // asks them to stop between calls, so queued commands can run first. Any
 // partial result is discarded; the read can simply be started again.
@@ -59,6 +61,12 @@ public:
     void mute(const Room& room, bool value, bool group = false);
     void join(const Room& room, const Room& destination);
     void ungroup(const Room& room);
+    // Takes the room out of its group and leaves the music with the others. A
+    // coordinator first hands the group to another member (Sonos's
+    // DelegateGroupCoordinationTo); plain ungrouping would keep the music on
+    // it and stop everyone else. A room alone is left as it is.
+    void leave(const Room& room);
+    Level level(const Room& room);
     void apply_area(const std::string& seed, const std::vector<std::string>& room_ids);
     // Coordinator lookups reuse the last topology until this is called, a
     // grouping change is made, or a room is missing from it.

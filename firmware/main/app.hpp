@@ -7,6 +7,7 @@
 struct Command {
     std::string action, ssid, password, seed, name;
     sonos::Room room;
+    sonos::Room target;   // Join/Leave: the room added to, or taken out of, room's group
     sonos::Favorite favorite;
     int value = 0;
     bool unmute = false;  // Volume/GroupVolume: also clear mute, after the level is set

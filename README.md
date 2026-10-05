@@ -11,7 +11,8 @@ Running on the Tab5: Apple Music and Sonos Radio favorites, queue view, artwork,
 Implemented:
 
 - Favorites screen restricted to Apple Music and Sonos Radio using service IDs supplied by the household; unknown/conflicting providers are excluded.
-- Room selection on the Rooms tab (the selected card carries its volume slider), now-playing text, play/pause/stop, capability-gated previous/next, room mute, room and group volume. Grouping is left to the Sonos app; the controller follows whatever groups exist.
+- Multi-room selection on the Rooms tab: the highlighted cards are the controlled room's Sonos group. Tapping another room joins it to that music; tapping a highlighted room takes it out (a coordinator hands the music to the rest first). Each selected card has that room's own volume slider; Now Playing shows group volume. Groups changed in the Sonos app are reflected.
+- Now-playing text, play/pause/stop, capability-gated previous/next, room/group mute and volume.
 - Optional startup room and starting volume: `CONFIG_TAB5_DEFAULT_ROOM` (e.g. `Kitchen`) is selected at boot, and `CONFIG_TAB5_START_VOLUME` sets that room's level when a favorite is started there while it is idle. Both live in menuconfig under "Tab5 screen"; set them in `firmware/sdkconfig`.
 - Speaker discovery by SSDP and mDNS together, remembered room IPs as a fallback, and an optional manual speaker IP.
 - On-device Wi-Fi setup and persistent settings. Changing a saved network asks for a four-digit passcode, `CONFIG_TAB5_SETTINGS_PASSCODE` in menuconfig (default `1234`; set your own in `firmware/sdkconfig`).

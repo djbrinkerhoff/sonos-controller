@@ -263,6 +263,7 @@ struct Household {
     struct Member { std::string name, ip, coordinator; };
     std::map<std::string, Member> rooms;
     std::vector<sonos::Request> mutations;
+    bool reject_delegate = false;  // older firmware without DelegateGroupCoordinationTo
 
     std::string id_at(const std::string& ip) const {
         for (const auto& [id, room] : rooms) if (room.ip == ip) return id;
@@ -289,6 +290,12 @@ struct Household {
                 room.coordinator = heir;
             }
             rooms[id].coordinator = id;
+        } else if (request.action == "DelegateGroupCoordinationTo") {
+            if (reject_delegate) throw std::runtime_error("UPnP error 401");
+            const auto tag = request.body.find("<NewCoordinator>") + 16;
+            const auto heir = request.body.substr(tag, request.body.find('<', tag) - tag);
+            for (auto& [other, room] : rooms) if (room.coordinator == id) room.coordinator = heir;
+            rooms[id].coordinator = id;  // RejoinGroup 0: the old coordinator stands alone
         } else if (request.action == "SetAVTransportURI") {
             const std::string prefix = "x-rincon:";
             auto at = request.body.find(prefix);
@@ -344,6 +351,42 @@ void grouping_and_areas() {
     expect_throw([&] { client.apply_area("10.0.0.1", {}); }, "empty area was applied");
 }
 
+void leaving_a_group() {
+    auto household = std::make_shared<Household>();
+    household->rooms = {{"A", {"Kitchen", "10.0.0.1", "A"}}, {"B", {"Den", "10.0.0.2", "A"}},
+                        {"C", {"Patio", "10.0.0.3", "A"}}, {"D", {"Office", "10.0.0.4", "D"}}};
+    sonos::Client client([household](const sonos::Request& r) { return (*household)(r); });
+
+    client.leave(household->room("B"));  // a member: split it off
+    expect(household->log() == std::vector<std::string>({"BecomeCoordinatorOfStandaloneGroup@B"}), "member did not split off");
+    expect(household->rooms["B"].coordinator == "B" && household->rooms["C"].coordinator == "A", "member leave changed the rest of the group");
+    household->mutations.clear();
+
+    client.leave(household->room("A"));  // the coordinator: hand the music to C, then stand alone
+    expect(household->log() == std::vector<std::string>({"DelegateGroupCoordinationTo@A"}), "coordinator did not delegate");
+    expect(household->mutations.back().body.find("<NewCoordinator>C</NewCoordinator><RejoinGroup>0</RejoinGroup>") != std::string::npos,
+           "delegation named the wrong heir or rejoined");
+    expect(household->rooms["A"].coordinator == "A" && household->rooms["C"].coordinator == "C", "coordinator leave did not keep the music on the others");
+    household->mutations.clear();
+
+    client.leave(household->room("D"));  // alone already
+    expect(household->mutations.empty(), "leaving a room that is alone sent a command");
+
+    household->rooms["B"].coordinator = "A";  // {A, B} again; this firmware rejects delegation
+    household->reject_delegate = true;
+    client.leave(household->room("A"));
+    expect(household->log() == std::vector<std::string>({"DelegateGroupCoordinationTo@A", "BecomeCoordinatorOfStandaloneGroup@A"}),
+           "rejected delegation did not fall back to splitting off");
+    expect(household->rooms["A"].coordinator == "A", "fallback did not take the room out");
+
+    sonos::Client levels([](const sonos::Request& r) {
+        if (r.action == "GetVolume") return soap("<CurrentVolume>23</CurrentVolume>");
+        if (r.action == "GetMute") return soap("<CurrentMute>1</CurrentMute>");
+        throw std::runtime_error("unexpected " + r.action);
+    });
+    const auto level = levels.level({"A", "Kitchen", "10.0.0.1", "A"});
+    expect(level.volume == 23 && level.muted, "room level not read");
+}
 void group_volume_and_state() {
     std::vector<sonos::Request> requests;
     const std::string track = "<DIDL-Lite><item><dc:title>Song</dc:title><dc:creator>Artist</dc:creator>"
@@ -501,6 +544,7 @@ int main() {
         commands_and_paging();
         update_changes_and_argument_order();
         grouping_and_areas();
+        leaving_a_group();
         group_volume_and_state();
         clocks_and_summary();
         queue_and_track_playback();

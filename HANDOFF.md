@@ -293,7 +293,7 @@ Restoring the vendor defaults fixed it completely. This would have been misdiagn
 - SSDP auto-discovery: **intermittent** — found a speaker on one boot, none on the next. Manual-IP path works reliably.
 - SOAP against a real speaker (`ListAvailableServices`, topology, favorites): **passed** with zero errors over a 110 s run at the raised timeout.
 - Audible playback: **passed.** User confirmed audio plays, pauses, and responds to volume up/down on a real Apple Music favorite. This retires the central architectural risk in `PLAN.md` — Sonos does play Apple Music content from a preserved favorite URI, so the favorites-first scope is viable.
-- Room/group volume, grouping/ungrouping, saved areas, queue viewing, and external changes from the official app: **still not performed.** The Sonos Radio favorite passed in session 3.
+- Grouping on hardware (October 2026, Rooms multi-select): join, member leave, coordinator leave via `DelegateGroupCoordinationTo` (the music moved to the remaining room), rejoin, and rapid repeated toggles all **passed** on paused/idle rooms. Room/group volume, queue viewing, and external changes from the official app: **still not performed.** The Sonos Radio favorite passed in session 3.
 
 ## Open items
 
