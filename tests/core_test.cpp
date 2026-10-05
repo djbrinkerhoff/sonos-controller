@@ -462,13 +462,13 @@ void clocks_and_summary() {
            "non-time accepted as a clock");
     std::vector<sonos::Request> requests;
     const std::string track = "<DIDL-Lite><item><dc:title>Song</dc:title><dc:creator>Artist</dc:creator></item></DIDL-Lite>";
-    std::string duration = "0:04:00";
+    std::string duration = "0:04:00", metadata = track, uri = "x-sonos-http:song.mp4";
     sonos::Client client([&](const sonos::Request& request) {
         requests.push_back(request);
         if (request.action == "GetZoneGroupState") return topology("192.168.1.9", "RINCON_COORD");
         if (request.action == "GetPositionInfo")
             return soap("<Track>1</Track><TrackDuration>" + duration + "</TrackDuration><RelTime>0:01:30</RelTime><TrackMetaData>" +
-                        xml_escape(track) + "</TrackMetaData>");
+                        xml_escape(metadata) + "</TrackMetaData><TrackURI>" + uri + "</TrackURI>");
         if (request.action == "GetTransportInfo") return soap("<CurrentTransportState>PLAYING</CurrentTransportState>");
         if (request.action == "GetVolume" || request.action == "GetGroupVolume") return soap("<CurrentVolume>5</CurrentVolume>");
         if (request.action == "GetMute") return soap("<CurrentMute>0</CurrentMute>");
@@ -484,6 +484,13 @@ void clocks_and_summary() {
     auto summary = client.summary(coordinator);
     expect(requests.size() == 2 && summary.title == "Song" && summary.artist == "Artist" && summary.playback == "PLAYING",
            "summary should take two calls and report title, artist and state");
+    // TV and line-in carry no metadata; they are named the way the Sonos app names them.
+    metadata = "NOT_IMPLEMENTED"; uri = "x-sonos-htastream:RINCON_COORD:spdif";
+    expect(client.state(coordinator).title == "TV" && client.summary(coordinator).title == "TV", "TV input not named");
+    uri = "x-rincon-stream:RINCON_COORD";
+    expect(client.summary(coordinator).title == "Line-In", "line-in not named");
+    uri = "x-sonos-http:song.mp4";
+    expect(client.summary(coordinator).title.empty(), "a track without metadata was given a source name");
 }
 
 int main() {

@@ -758,10 +758,12 @@ void ui_build() {
     lv_obj_set_style_bg_opa(toast,LV_OPA_COVER,0); lv_obj_set_style_bg_color(toast,c(ink::raised),0);
     lv_obj_set_style_radius(toast,LV_RADIUS_CIRCLE,0); lv_obj_set_style_pad_hor(toast,36,0); lv_obj_set_style_pad_ver(toast,20,0);
     lv_obj_set_style_shadow_width(toast,40,0); lv_obj_set_style_shadow_opa(toast,LV_OPA_50,0);
-    lv_obj_set_size(toast,LV_SIZE_CONTENT,LV_SIZE_CONTENT); lv_obj_set_style_max_width(toast,900,0);
+    lv_obj_set_size(toast,LV_SIZE_CONTENT,LV_SIZE_CONTENT); lv_obj_set_style_max_width(toast,760,0);
     auto toast_text=text(toast,&font_body_26,ink::text,""); lv_label_set_long_mode(toast_text,LV_LABEL_LONG_DOT);
-    lv_obj_set_style_max_width(toast_text,828,0);
-    lv_obj_align(toast,LV_ALIGN_BOTTOM_MID,RAIL/2,-40);
+    lv_obj_set_style_max_width(toast_text,688,0);
+    // In the header's empty middle, clear of controls; 760 px centered on the
+    // content area stops short of the battery status on the right.
+    lv_obj_align(toast,LV_ALIGN_TOP_MID,RAIL/2,(HEADER-72)/2);  // 72: 20 + 32 px line + 20
     lv_obj_add_flag(toast,LV_OBJ_FLAG_HIDDEN);
     toast_timer=lv_timer_create(toast_hide,3500,nullptr); lv_timer_pause(toast_timer);
     render_now_playing();

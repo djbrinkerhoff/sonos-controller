@@ -272,6 +272,11 @@ std::vector<QueueItem> Client::queue(const Room& room, int start, int count, int
     if (total) *total = number(response.at("TotalMatches"));
     return parse_queue(response.at("Result"), start + 1);
 }
+std::string source_title(const std::string& track_uri) {
+    if (track_uri.rfind("x-sonos-htastream:",0)==0) return "TV";
+    if (track_uri.rfind("x-rincon-stream:",0)==0) return "Line-In";
+    return "";
+}
 State Client::state(const Room& room) {
     auto target = coordinator(room);
     auto hold = [&] { if (interrupt_ && interrupt_()) throw Preempted(); };
@@ -303,6 +308,7 @@ State Client::state(const Room& room) {
         s.album=text(descendant(doc.RootElement(),"album"));
         s.art=text(descendant(doc.RootElement(),"albumArtURI"));
     }
+    if (s.title.empty()) s.title=source_title(p["TrackURI"]);
     return s;
 }
 Summary Client::summary(const Room& coordinator) {
@@ -314,6 +320,7 @@ Summary Client::summary(const Room& coordinator) {
         s.title=text(descendant(doc.RootElement(),"title"));
         s.artist=text(descendant(doc.RootElement(),"creator"));
     }
+    if (s.title.empty()) s.title=source_title(p["TrackURI"]);
     return s;
 }
 void Client::play_favorite(const Room& room, const Favorite& favorite) {

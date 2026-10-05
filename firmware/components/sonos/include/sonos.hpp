@@ -31,6 +31,9 @@ struct Summary { std::string title, artist, playback; };
 // partial result is discarded; the read can simply be started again.
 struct Preempted : std::runtime_error { Preempted() : std::runtime_error("read preempted by a queued command") {} };
 int parse_clock(const std::string& hms);  // "H:MM:SS" -> seconds, -1 if not a time
+// What the Sonos app calls a source that has no track metadata: "TV" for a
+// soundbar's HDMI/optical input, "Line-In" for analog in; "" for anything else.
+std::string source_title(const std::string& track_uri);
 std::string escape(const std::string& value);
 Fields parse_response(const std::string& xml);
 std::vector<Room> parse_rooms(const std::string& xml);
