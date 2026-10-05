@@ -163,7 +163,19 @@ void motion_task(void*) {
     driver.interface=BMI270_USE_I2C;
     driver.i2c_bus=bsp_i2c_get_handle();
     bmi270_handle_t* imu=nullptr;
-    esp_err_t result=driver.i2c_bus?bmi270_create(&driver,&imu):ESP_ERR_INVALID_STATE;
+    // bmi270_create() soft-resets the chip and then waits pdMS_TO_TICKS(10),
+    // which at 100 Hz is one tick: anywhere from ~0 to 10 ms, depending on
+    // where the reset lands relative to the tick. Too short, and the next read
+    // finds the chip still restarting ("Failed to read the power config").
+    // Boot is deterministic, so a given image either always or never hit it.
+    // Starting right after a tick makes the wait a full tick; retry anyway.
+    esp_err_t result=ESP_ERR_INVALID_STATE;
+    for(int attempt=1;driver.i2c_bus && attempt<=3;++attempt) {
+        vTaskDelay(1);  // begin at a tick boundary
+        if((result=bmi270_create(&driver,&imu))==ESP_OK) break;
+        ESP_LOGW(TAG,"BMI270 start attempt %d failed: %s",attempt,esp_err_to_name(result));
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
     if(result==ESP_OK) {
         bmi270_config_t config{BMI270_ACC_ODR_50_HZ,BMI270_ACC_RANGE_4_G,BMI270_GYR_ODR_50_HZ,BMI270_GYR_RANGE_500_DPS};
         result=bmi270_start(imu,&config);

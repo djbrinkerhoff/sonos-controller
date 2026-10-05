@@ -15,13 +15,15 @@ The details are in the session sections below. These are the rules they add up t
 - **Measure before changing and after.** The battery work only found where the current went (the Wi-Fi radio at full power, the display stream, the CPU clock) by switching one thing at a time with the INA226 (`/power`). Several obvious suspects measured as nothing (IMU polling, LVGL, stopping the radio instead of modem sleep).
 - **Battery current needs the USB cable unplugged.** On USB the system runs from USB and the pack current reads 0 (or the charge current).
 - **Control the variables.** Mid-measurement, the screen timer dimmed the backlight and made a whole run worthless; an earlier UI ablation was invalid because zsh does not word-split `set -- $var` (use `bash script.sh`). Pin every state you are not testing.
-- **Timestamps can lie.** The log tick does not advance in manual light sleep, and uptime that is shorter than expected means the device restarted. Read `Reset reason` at boot: 3 is a software restart (OTA), 6 is the task watchdog.
+- **Timestamps can lie.** The log tick does not advance in manual light sleep, and uptime that is shorter than expected means the device restarted. Read `Reset reason` at boot: 3 is a software restart (OTA), 6 is the task watchdog, 7 another watchdog. The power-button reboot reports 7 and does not power-cycle the sensors, which stay on the battery rail.
 
 **Keeping the device recoverable**
 - **Never run a risky experiment on the device when nobody is there to reset it.** A diagnostic DSI read hung the HTTP server, so no OTA could get through, and the device sat dark and unreachable for hours while the user was away.
 - **ESP-IDF's DSI code has no timeouts.** A read the panel cannot answer (for example with the lanes in ULPS) spins forever. `CONFIG_ESP_TASK_WDT_PANIC` now turns any 5 s stall into a restart; keep it on.
 - **The build script's exit status is not enough.** `build | grep` succeeds on an error line, so a failed build silently redeployed the previous image. Check for "Project build complete" before deploying.
 - **Recovery over USB:** opening the serial port resets the chip. If it then sits at "waiting for download" (`boot:0x204`), `esptool --after watchdog_reset read_mac` starts the app. Opening the port with DTR and RTS preset low avoids the download-mode strap.
+
+- **Check `Motion detection started` in the boot log after every flash.** The BMI270 driver waits `pdMS_TO_TICKS(10)` after its soft reset, which at `CONFIG_FREERTOS_HZ=100` is one tick, 0-10 ms depending on phase. Boot is deterministic, so an unrelated change (new fonts, in October 2026) made every boot of one image read the chip too early ("Failed to read the power config") and silently disable motion wake. `motion_task` now starts on a tick boundary and retries; an image without motion also skips deep display sleep and standby.
 
 **Platform facts (Tab5, ESP32-P4, LVGL 9.4)**
 - The ST7121 is a TDDI: display and touch share one chip. Touch scans only while the video stream runs. After panel sleep (SLPIN) a short SLPOUT/DISPON does not bring the image back; only a full reset and init (1.1 s) does. So the screen is switched off with DISPOFF, never slept.
