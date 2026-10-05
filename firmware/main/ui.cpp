@@ -304,6 +304,10 @@ void progress_tick(lv_timer_t*) { if(view==View::NowPlaying && !screen_off()) re
 void render_now_playing() {
     const bool playing_something=have_state && !current.title.empty();
     lv_label_set_text(np_title,playing_something?current.title.c_str():"Nothing playing");
+    // LVGL only truncates with "..." at a fixed height: measure, then cap at two lines.
+    lv_obj_set_height(np_title,LV_SIZE_CONTENT); lv_obj_update_layout(np_title);
+    const int32_t two_lines=2*lv_font_get_line_height(&font_title_56);
+    if(lv_obj_get_height(np_title)>two_lines) lv_obj_set_height(np_title,two_lines);
     lv_label_set_text(np_artist,playing_something?current.artist.c_str():"");
     lv_label_set_text(np_album,playing_something?current.album.c_str():"");
     lv_obj_set_flag(np_full,LV_OBJ_FLAG_HIDDEN,!playing_something);
@@ -338,26 +342,32 @@ void build_now_playing(lv_obj_t* v) {
     now_art.build(np_full,art_spec::now_side,art_spec::now_radius,LV_SYMBOL_AUDIO);
     lv_obj_align(now_art.frame,LV_ALIGN_LEFT_MID,PAD,0);
     const int x=PAD+480+56, width=CONTENT_W-x-PAD;
-    auto info=column(np_full,0); lv_obj_set_size(info,width,480); lv_obj_align(info,LV_ALIGN_LEFT_MID,x,0);
+    // Title (<=136) + artist/album (~84) + progress/times (40) + transport (128)
+    // + volume (96) + group caption (28) = 512, so the column overhangs the
+    // 480 px artwork by 24 px top and bottom rather than squeezing rows together.
+    auto info=column(np_full,0); lv_obj_set_size(info,width,528); lv_obj_align(info,LV_ALIGN_LEFT_MID,x,0);
     lv_obj_set_flex_align(info,LV_FLEX_ALIGN_START,LV_FLEX_ALIGN_START,LV_FLEX_ALIGN_START);
     np_title=text(info,&font_title_56,ink::text,"Nothing playing");
     lv_obj_set_width(np_title,width); lv_label_set_long_mode(np_title,LV_LABEL_LONG_DOT);
-    lv_obj_set_style_max_height(np_title,136,0); lv_obj_set_height(np_title,LV_SIZE_CONTENT);
+    lv_obj_set_height(np_title,LV_SIZE_CONTENT);  // clamped to two lines in render_now_playing
+    // The top padding sits inside one_line's fixed height, so add it back or descenders clip.
     np_artist=one_line(text(info,&font_body_32,ink::muted),width); lv_obj_set_style_pad_top(np_artist,8,0);
+    lv_obj_set_height(np_artist,lv_font_get_line_height(&font_body_32)+8);
     np_album=one_line(text(info,&font_body_26,ink::faint),width); lv_obj_set_style_pad_top(np_album,4,0);
+    lv_obj_set_height(np_album,lv_font_get_line_height(&font_body_26)+4);
     auto grow=div(info); lv_obj_set_flex_grow(grow,1);
     np_progress=lv_bar_create(info); lv_obj_set_size(np_progress,width,8);
     lv_obj_set_style_bg_color(np_progress,c(ink::raised),0); lv_obj_set_style_bg_opa(np_progress,LV_OPA_COVER,0);
     lv_obj_set_style_bg_color(np_progress,c(ink::text),LV_PART_INDICATOR);
-    np_times=div(info); lv_obj_set_size(np_times,width,36);
+    np_times=div(info); lv_obj_set_size(np_times,width,32);
     np_elapsed=text(np_times,&font_caption_22,ink::faint); lv_obj_align(np_elapsed,LV_ALIGN_LEFT_MID,0,0);
     np_remaining=text(np_times,&font_caption_22,ink::faint); lv_obj_align(np_remaining,LV_ALIGN_RIGHT_MID,0,0);
-    auto transport=row(info,48); lv_obj_set_size(transport,width,136);
+    auto transport=row(info,48); lv_obj_set_size(transport,width,128);
     lv_obj_set_flex_align(transport,LV_FLEX_ALIGN_CENTER,LV_FLEX_ALIGN_CENTER,LV_FLEX_ALIGN_CENTER);
     np_prev=icon_button(transport,LV_SYMBOL_PREV,104,false,transport_clicked,(void*)"Previous");
     np_play=icon_button(transport,LV_SYMBOL_PLAY,128,true,transport_clicked,(void*)"Toggle");
     np_next=icon_button(transport,LV_SYMBOL_NEXT,104,false,transport_clicked,(void*)"Next");
-    auto volume=row(info,24); lv_obj_set_size(volume,width,TARGET); lv_obj_set_style_margin_top(volume,16,0);
+    auto volume=row(info,24); lv_obj_set_size(volume,width,TARGET); lv_obj_set_style_margin_top(volume,8,0);
     np_mute=icon_button(volume,LV_SYMBOL_VOLUME_MAX,TARGET,false,mute_clicked);
     np_volume=volume_slider(volume,width-TARGET-72-2*24);
     np_volume_value=text(volume,&font_body_32,ink::text,"0"); lv_obj_set_width(np_volume_value,72);
