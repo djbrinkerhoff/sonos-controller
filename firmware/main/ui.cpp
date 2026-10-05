@@ -9,6 +9,7 @@
 #include "esp_timer.h"
 #include "misc/cache/instance/lv_image_cache.h"
 #include <algorithm>
+#include <functional>
 #include <map>
 #include <string_view>
 
@@ -167,14 +168,17 @@ constexpr int32_t TILE_W=art_spec::tile_side, TILE_TITLE_Y=art_spec::tile_side+8
 constexpr int32_t FAV_COLUMNS=5, FAV_GAP=22;
 static_assert((TILE_W+FAV_GAP)%2==0 && PAD%2==0,"tile x positions must stay even");
 static_assert(FAV_COLUMNS*TILE_W+(FAV_COLUMNS-1)*FAV_GAP<=CONTENT_W-2*PAD,"five favorite tiles must fit a row");
-// Every favorite gets a canvas, but the ~103 KB draw buffer behind it exists
-// only while the tile sits near the viewport: one buffer each at the accepted
-// 1,000-item catalog would need over 103 MiB. Covers are fetched on demand for
-// the same window and released together with their buffers.
+// Every favorite gets a canvas; the ~106 KB draw buffer behind it is made when
+// the tile first nears the viewport and then kept, up to TILE_BUDGET_BYTES.
+// Only past that budget (the accepted 1,000-item catalog would need over
+// 100 MiB) are the buffers farthest from the viewport released, and their
+// covers fetched again if they come back. The decoded cover is not kept: once
+// drawn into the tile it would only duplicate those pixels.
+constexpr size_t TILE_BUDGET_BYTES=16u<<20;  // of 32 MiB PSRAM; ~27 MiB is free with a full screen of covers
+constexpr size_t TILE_BUFFER_LIMIT=TILE_BUDGET_BYTES/(TILE_W*2*TILE_H);
 struct Tile {
     lv_obj_t* canvas=nullptr;
-    lv_draw_buf_t* pixels=nullptr;   // only while inside the cache window
-    Artwork art;                     // decoded cover while the tile is buffered
+    lv_draw_buf_t* pixels=nullptr;   // from first approach until evicted by the budget
     std::string title;               // wrapped and "..."-truncated by a label once
     bool radio=false, have_art=false;
     int64_t art_asked=0;             // esp_timer time of the last art request
@@ -182,7 +186,7 @@ struct Tile {
     Tile(Tile&& o) noexcept { *this=std::move(o); }
     Tile& operator=(Tile&& o) noexcept {
         if(this!=&o) {
-            canvas=o.canvas; pixels=o.pixels; art=std::move(o.art); title=std::move(o.title);
+            canvas=o.canvas; pixels=o.pixels; title=std::move(o.title);
             radio=o.radio; have_art=o.have_art; art_asked=o.art_asked; o.pixels=nullptr;
         }
         return *this;
@@ -420,9 +424,8 @@ void request_tile_art(size_t index) {
     auto k=new Command; k->action="TileArt"; k->value=static_cast<int>(index); k->name=favorites[index].id;
     if(submit(k)) t.art_asked=now;
 }
-// Holds draw buffers for the rows around the viewport (plus two rows of
-// margin in each direction) and releases the rest; covers are requested when
-// a tile enters the window.
+// Gives the rows around the viewport (one above, two below) a buffer and asks
+// for their covers; buffers elsewhere stay until the budget needs them back.
 constexpr int32_t FAV_PITCH=TILE_H+32;  // tile height + pad_row
 void update_tile_cache() {
     const int32_t top=lv_obj_get_scroll_y(fav_grid);
@@ -430,23 +433,34 @@ void update_tile_cache() {
     const int32_t hi_row=(top+lv_obj_get_height(fav_grid))/FAV_PITCH+2;
     const size_t lo=static_cast<size_t>(lo_row)*FAV_COLUMNS;
     const size_t hi=std::min<size_t>(tiles.size(),static_cast<size_t>(hi_row+1)*FAV_COLUMNS);
+    size_t buffered=0;
     for(size_t i=0;i<tiles.size();++i) {
         auto& t=tiles[i];
         if(i>=lo && i<hi) {
             if(!t.pixels) {
                 if(!(t.pixels=lv_draw_buf_create(TILE_W,TILE_H,LV_COLOR_FORMAT_RGB565,LV_STRIDE_AUTO))) continue;
                 lv_canvas_set_draw_buf(t.canvas,t.pixels);
-                compose_tile(t,t.have_art?&t.art:nullptr);
+                compose_tile(t,nullptr);
             }
             // Visible but artless: keep asking (10 s throttle inside) — the
             // first pass may have run while the screen was off and the
             // artwork worker drops tile jobs then.
             if(!t.have_art) request_tile_art(i);
-        } else if(t.pixels) {
-            lv_image_set_src(t.canvas,nullptr);  // detach the pixels before freeing them
-            lv_draw_buf_destroy(t.pixels); t.pixels=nullptr;
-            t.art=Artwork{}; t.have_art=false;
         }
+        if(t.pixels) ++buffered;
+    }
+    if(buffered<=TILE_BUFFER_LIMIT) return;
+    // Over budget: release the buffers farthest from the window first.
+    std::vector<std::pair<size_t,size_t>> far;  // (distance in tiles, index)
+    for(size_t i=0;i<tiles.size();++i)
+        if(tiles[i].pixels && (i<lo || i>=hi)) far.push_back({i<lo?lo-i:i-hi+1,i});
+    std::sort(far.begin(),far.end(),std::greater<>());
+    for(auto& [distance,i]:far) {
+        if(buffered<=TILE_BUFFER_LIMIT) break;
+        auto& t=tiles[i];
+        lv_image_set_src(t.canvas,nullptr);  // detach the pixels before freeing them
+        lv_draw_buf_destroy(t.pixels); t.pixels=nullptr; t.have_art=false;
+        --buffered;
     }
 }
 void fav_scrolled(lv_event_t*) { update_tile_cache(); }
@@ -797,9 +811,9 @@ void ui_favorite_art(const std::string& id,size_t index,Artwork art) {
     DisplayLock lock;
     if(index>=favorites.size() || index>=tiles.size() || favorites[index].id!=id) return;
     auto& t=tiles[index];
-    if(!t.pixels) return;  // scrolled out of the cache window; the fetch is dropped
-    t.art=std::move(art); t.have_art=t.art.pixels!=nullptr;
-    compose_tile(t,t.have_art?&t.art:nullptr);
+    if(!t.pixels) return;  // released by the budget meanwhile; the fetch is dropped
+    t.have_art=art.pixels!=nullptr;
+    compose_tile(t,&art);  // the tile now holds these pixels; the decode is freed on return
     lv_obj_invalidate(t.canvas);
 }
 void ui_state(const sonos::Room& room,const sonos::State& state) {

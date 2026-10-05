@@ -124,9 +124,11 @@ void refresh() {
     if(discovered) { seed=discover_speaker(); found=client.rooms(seed); }
     ESP_LOGI(TAG,"Using speaker %s (%s), %u rooms",seed.c_str(),discovered?"discovered":"stored",static_cast<unsigned>(found.size()));
     save_known_speakers(found);
-    favorites=client.favorites(seed);
-    published=found; ui_rooms(found);
-    ui_favorites(favorites);
+    // Reconnects (standby wake, Wi-Fi blips) land here too. Republishing an
+    // unchanged list would rebuild every tile and refetch all covers.
+    auto fresh=client.favorites(seed);
+    push_rooms(found);
+    if(!catalog_loaded || !same_favorites(fresh,favorites)) { favorites=std::move(fresh); ui_favorites(favorites); }
     catalog_loaded=true;
     ota_mark_healthy(); // a new image proves itself by reaching the speakers
 }

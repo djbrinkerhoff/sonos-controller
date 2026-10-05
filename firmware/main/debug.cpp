@@ -190,6 +190,9 @@ esp_err_t perf(httpd_req_t* request) {
              static_cast<int>(lv_area_get_width(&band)),static_cast<int>(lv_area_get_height(&band)),static_cast<int>(band.y1)); out+=line;
     snprintf(line,sizeof line,"internal DMA heap free %u KB, largest block %u KB, lost PPA completions %u\n",static_cast<unsigned>(dma_free/1024),
              static_cast<unsigned>(dma_block/1024),static_cast<unsigned>(fast_flush_lost_completions())); out+=line;
+    snprintf(line,sizeof line,"PSRAM free %u KB of %u KB, low-water %u KB, largest block %u KB\n",
+             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)/1024),static_cast<unsigned>(heap_caps_get_total_size(MALLOC_CAP_SPIRAM)/1024),
+             static_cast<unsigned>(heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM)/1024),static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)/1024)); out+=line;
     if(down) { snprintf(line,sizeof line,"last tap: down, up at +%.0f ms\n",(up-down)/1000.0); out+=line; }
     for(auto& f:copy) {
         const double since=down?(f.end_us-down)/1000.0:0;
