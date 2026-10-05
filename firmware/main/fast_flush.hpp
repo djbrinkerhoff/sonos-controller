@@ -8,6 +8,9 @@ bool fast_flush_install(lv_display_t* display);
 // The panel's framebuffer (native 720x1280 RGB565), or nullptr; for /panel.
 const uint16_t* fast_flush_framebuffer();
 uint32_t fast_flush_lost_completions();  // PPA completions that timed out; should stay 0
+// Switches to CPU rotation for good, as a wedged PPA does; call with the
+// display lock held. For exercising that path (/ppa?cpu=1).
+void fast_flush_force_cpu();
 // While suspended, flushes are dropped: the panel driver may be deleted.
 // Resume takes the (possibly recreated) panel; false if it has no framebuffer.
 void fast_flush_suspend();

@@ -38,6 +38,16 @@ std::atomic<uint32_t> band_started{0}, band_finished{0}, band_dropped{0};
 lv_area_t band_area; const uint16_t* band_pixels=nullptr;
 uint32_t consecutive_failures=0;
 bool software_rotation=false;
+bool band_on_cpu=false;  // this band was already drawn by rotate_cpu in flush()
+// After the switch to CPU rotation, repaint everything once: bands from the
+// wedged period may be stale or torn.
+void repaint_all(void*) { lv_obj_invalidate(lv_screen_active()); lv_obj_invalidate(lv_layer_top()); }
+void use_cpu_from_now_on(const char* why) {
+    if(software_rotation) return;
+    software_rotation=true;
+    ESP_LOGE(TAG,"%s; rotating on CPU from now on",why);
+    lv_async_call(repaint_all,nullptr);
+}
 
 // CPU equivalent of the SRM 90-degree rotation: logical (x,y) maps to
 // framebuffer offset (1279-x)*720+y, so a column of the LVGL band lands as a
@@ -49,9 +59,15 @@ void rotate_cpu(const lv_area_t* area,const uint16_t* pixels) {
         for(int y=0;y<h;++y) dst[y]=pixels[y*w+x];
     }
     // The framebuffer is in PSRAM; push the band out of the CPU cache before
-    // the DPI peripheral's DMA reads it.
+    // the DPI peripheral's DMA reads it. Band offsets are almost never on a
+    // 128-byte cache line, and without UNALIGNED the sync refuses and does
+    // nothing: the pixels then reach the panel only on a random later
+    // eviction, which showed as streaks of stale content.
     const size_t offset=(NATIVE_H-1-area->x2)*NATIVE_W+area->y1;
-    esp_cache_msync(framebuffer+offset,w*NATIVE_W*2,ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+    if(esp_cache_msync(framebuffer+offset,w*NATIVE_W*2,ESP_CACHE_MSYNC_FLAG_DIR_C2M|ESP_CACHE_MSYNC_FLAG_UNALIGNED)!=ESP_OK) {
+        static bool warned=false;
+        if(!warned) { warned=true; ESP_LOGE(TAG,"framebuffer cache write-back failed"); }
+    }
 }
 
 bool IRAM_ATTR rotated(ppa_client_handle_t,ppa_event_data_t*,void*) {
@@ -61,6 +77,11 @@ bool IRAM_ATTR rotated(ppa_client_handle_t,ppa_event_data_t*,void*) {
     return woken==pdTRUE;
 }
 void wait_for_band(lv_display_t* display) {
+    // Drawn on the CPU already: nothing to wait for, and no PPA completion to
+    // count. (Treating it as one reset the failure count every band, so the
+    // switch to CPU rotation never happened and every band retried the
+    // wedged engine.)
+    if(band_on_cpu) { lv_display_flush_ready(display); return; }
     const uint32_t seq=band_started.load();
     // Outstanding = started - finished - dropped; dropped counts transactions
     // we timed out on, so a ghost that never completes cannot stall every
@@ -77,10 +98,7 @@ void wait_for_band(lv_display_t* display) {
     else if(framebuffer && band_pixels) {
         rotate_cpu(&band_area,band_pixels);
         band_dropped.store(seq-band_finished.load());
-        if(++consecutive_failures>=8 && !software_rotation) {
-            software_rotation=true;
-            ESP_LOGE(TAG,"PPA transactions never complete; rotating on CPU from now on");
-        }
+        if(++consecutive_failures>=8) use_cpu_from_now_on("PPA transactions never complete");
     }
     lv_display_flush_ready(display);
 }
@@ -89,6 +107,7 @@ void flush(lv_display_t* display,const lv_area_t* area,uint8_t* pixels) {
     const int w=lv_area_get_width(area), h=lv_area_get_height(area);
     band_area=*area; band_pixels=reinterpret_cast<const uint16_t*>(pixels);
     band_started.fetch_add(1);
+    band_on_cpu=software_rotation;
     if(software_rotation) { rotate_cpu(area,band_pixels); band_finished.fetch_add(1); return; }
     // Same mapping as esp_lvgl_port's PPA path for LV_DISPLAY_ROTATION_90.
     ppa_srm_oper_config_t op={};
@@ -106,10 +125,8 @@ void flush(lv_display_t* display,const lv_area_t* area,uint8_t* pixels) {
         // queued transaction never completed): draw this band on the CPU.
         rotate_cpu(area,band_pixels);
         band_finished.fetch_add(1);
-        if(++consecutive_failures>=8 && !software_rotation) {
-            software_rotation=true;
-            ESP_LOGE(TAG,"PPA submissions keep failing; rotating on CPU from now on");
-        }
+        band_on_cpu=true;
+        if(++consecutive_failures>=8) use_cpu_from_now_on("PPA submissions keep failing");
     }
 }
 // The first fields of esp_lvgl_port 2.6's private per-display context. The
@@ -131,6 +148,7 @@ bool fast_flush_resume(esp_lcd_panel_handle_t panel) {
 
 const uint16_t* fast_flush_framebuffer() { return framebuffer; }
 uint32_t fast_flush_lost_completions() { return lost_completions; }
+void fast_flush_force_cpu() { use_cpu_from_now_on("Forced by /ppa"); }
 bool fast_flush_install(lv_display_t* display) {
     if(lv_display_get_rotation(display)!=LV_DISPLAY_ROTATION_90) return false;
     context=static_cast<PortContextPrefix*>(lv_display_get_driver_data(display));

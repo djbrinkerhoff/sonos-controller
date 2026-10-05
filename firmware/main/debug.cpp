@@ -84,6 +84,15 @@ esp_err_t screenshot(httpd_req_t* request) {
 
 // What the panel actually shows: the DPI framebuffer, rotated back to landscape.
 // /screenshot renders LVGL's widgets instead, so it cannot catch flush bugs.
+// /ppa?cpu=1 switches the display to CPU rotation, the path a wedged PPA
+// falls back to, so it can be checked without waiting for the driver race.
+esp_err_t ppa_mode(httpd_req_t* request) {
+    char query[16]{}, value[4]{};
+    if(httpd_req_get_url_query_str(request,query,sizeof query)!=ESP_OK || httpd_query_key_value(query,"cpu",value,sizeof value)!=ESP_OK || strcmp(value,"1"))
+        return httpd_resp_send_err(request,HTTPD_400_BAD_REQUEST,"use /ppa?cpu=1 (until restart)");
+    bsp_display_lock(0); fast_flush_force_cpu(); bsp_display_unlock();
+    return httpd_resp_sendstr(request,"rotating on CPU until restart");
+}
 esp_err_t panel(httpd_req_t* request) {
     const uint16_t* fb=fast_flush_framebuffer();
     if(!fb) return httpd_resp_send_err(request,HTTPD_500_INTERNAL_SERVER_ERROR,"framebuffer unavailable");
@@ -356,6 +365,8 @@ void debug_register(httpd_handle_t server) {
     static const httpd_uri_t drag_uri{.uri="/drag",.method=HTTP_GET,.handler=drag,.user_ctx=nullptr};
     static const httpd_uri_t panel_uri{.uri="/panel",.method=HTTP_GET,.handler=panel,.user_ctx=nullptr};
     httpd_register_uri_handler(server,&panel_uri);
+    static const httpd_uri_t ppa_uri{.uri="/ppa",.method=HTTP_GET,.handler=ppa_mode,.user_ctx=nullptr};
+    httpd_register_uri_handler(server,&ppa_uri);
     static const httpd_uri_t power_uri{.uri="/power",.method=HTTP_GET,.handler=power,.user_ctx=nullptr};
     httpd_register_uri_handler(server,&power_uri);
     httpd_register_uri_handler(server,&drag_uri);
