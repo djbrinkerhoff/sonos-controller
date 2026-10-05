@@ -303,8 +303,11 @@ void worker(void*) {
                     // costs at most one extra fetch.
                     if(c->room.id==art_room && c->name==art_uri) art_done=c->value!=0 || art_sent>=MAX_ART_SENDS;
                 }
-                else if(a=="Volume") client.volume(c->room,c->value);
-                else if(a=="GroupVolume") client.volume(c->room,c->value,true);
+                else if(a=="Volume" || a=="GroupVolume") {
+                    const bool group=a=="GroupVolume";
+                    client.volume(c->room,c->value,group);  // level first, so unmuting never plays the old one
+                    if(c->unmute) client.mute(c->room,false,group);
+                }
                 else if(a=="Mute") client.mute(c->room,c->value);
                 else if(a=="GroupMute") client.mute(c->room,c->value,true);
                 else if(a=="Wake") invalidate();

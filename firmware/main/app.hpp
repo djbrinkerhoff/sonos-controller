@@ -9,6 +9,7 @@ struct Command {
     sonos::Room room;
     sonos::Favorite favorite;
     int value = 0;
+    bool unmute = false;  // Volume/GroupVolume: also clear mute, after the level is set
 };
 
 // Hands a command to the worker, taking ownership. Returns false (and deletes

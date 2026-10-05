@@ -14,6 +14,8 @@
 #include <string_view>
 
 LV_FONT_DECLARE(font_title_56)
+LV_FONT_DECLARE(font_title_36)
+LV_FONT_DECLARE(font_body_36)
 LV_FONT_DECLARE(font_body_32)
 LV_FONT_DECLARE(font_body_26)
 LV_FONT_DECLARE(font_caption_22)
@@ -23,7 +25,7 @@ namespace {
 // Design tokens. The panel is ~11.6 px/mm and read from arm's length, so the
 // smallest tap target is 88 px (~7.5 mm) and body text is 26 px or larger.
 namespace ink {
-constexpr uint32_t bg=0x0F1216, rail=0x0A0D10, surface=0x1A1F25, raised=0x242B33, pressed=0x323B45;
+constexpr uint32_t bg=0x0F1216, surface=0x1A1F25, raised=0x242B33, pressed=0x323B45;
 constexpr uint32_t text=0xF2F4F6, quiet=0xB4BBC3, muted=0xA3ADB8, faint=0x6E7883, accent=0xF5A524, on_accent=0x1C1405, danger=0xFF6B6B;
 }
 constexpr int RAIL=128, HEADER=96, W=1280, H=720, CONTENT_W=W-RAIL, CONTENT_H=H-HEADER, PAD=40, TARGET=88;
@@ -153,7 +155,7 @@ lv_obj_t *battery_label,*offline_label,*toast,*keyboard;
 lv_timer_t* toast_timer;
 // Now Playing
 ArtFrame now_art;
-lv_obj_t *np_title,*np_artist,*np_album,*np_progress,*np_elapsed,*np_remaining,*np_times;
+lv_obj_t *np_title,*np_artist,*np_progress,*np_elapsed,*np_remaining,*np_times;
 lv_obj_t *np_prev,*np_play,*np_next,*np_mute,*np_volume,*np_volume_value,*np_volume_caption;
 lv_obj_t *np_full,*np_empty,*np_empty_title,*np_empty_button;  // playing layout vs. centered empty state
 // Favorites
@@ -205,10 +207,11 @@ enum class SettingsMode { Summary, Passcode, Form };
 lv_obj_t *settings_summary,*settings_passcode,*settings_form,*ssid_value,*pin_dots[4];
 std::string pin_entry;
 
+constexpr lv_opa_t RAIL_ACTIVE_OPA=0x3D;  // the active tab is tinted with the accent at 24%
 void render_rail() {
     for(int i=0;i<5;++i) {
         const bool active=static_cast<int>(view)==i;
-        lv_obj_set_style_bg_opa(rail_items[i],active?LV_OPA_COVER:LV_OPA_TRANSP,0);
+        lv_obj_set_style_bg_opa(rail_items[i],active?RAIL_ACTIVE_OPA:LV_OPA_TRANSP,0);
         for(uint32_t k=0;k<lv_obj_get_child_count(rail_items[i]);++k)
             lv_obj_set_style_text_color(lv_obj_get_child(rail_items[i],k),c(active?ink::accent:ink::muted),0);
     }
@@ -252,12 +255,24 @@ void transport_clicked(lv_event_t* e) {
     send(for_room(action.c_str()));
 }
 bool grouped() { return group_of(selected).size()>1; }
+bool muted_now() { return grouped()?current.group_muted:current.muted; }
+// Muted reads as zero on every volume bar; unmuting puts the real level back.
+int shown_volume() { return muted_now()?0:grouped()?current.group_volume:current.volume; }
+void render_volume() {
+    set_icon(np_mute,muted_now()?LV_SYMBOL_MUTE:LV_SYMBOL_VOLUME_MAX);
+    const bool dragging=lv_obj_has_state(np_volume,LV_STATE_PRESSED) || (room_volume && lv_obj_has_state(room_volume,LV_STATE_PRESSED));
+    if(dragging) return;
+    const int level=shown_volume();
+    lv_slider_set_value(np_volume,level,LV_ANIM_OFF);
+    if(room_volume) lv_slider_set_value(room_volume,level,LV_ANIM_OFF);
+    lv_label_set_text_fmt(np_volume_value,"%d",level);
+}
 void mute_clicked(lv_event_t*) {
     if(selected.id.empty()) return;
-    const bool muted=grouped()?current.group_muted:current.muted;
+    const bool muted=muted_now();
     auto k=for_room(grouped()?"GroupMute":"Mute"); k->value=!muted; send(k);
     if(grouped()) current.group_muted=!muted; else current.muted=!muted;
-    set_icon(np_mute,!muted?LV_SYMBOL_MUTE:LV_SYMBOL_VOLUME_MAX);
+    render_volume();
 }
 // Now Playing and the selected room's card each have a volume slider; dragging
 // either moves the other, and releasing sends the level.
@@ -268,8 +283,11 @@ void volume_event(lv_event_t* e) {
     if(slider!=np_volume) lv_slider_set_value(np_volume,value,LV_ANIM_OFF);
     if(room_volume && slider!=room_volume) lv_slider_set_value(room_volume,value,LV_ANIM_OFF);
     if(lv_event_get_code(e)==LV_EVENT_RELEASED && !selected.id.empty()) {
-        auto k=for_room(grouped()?"GroupVolume":"Volume"); k->value=value; send(k);
-        if(grouped()) current.group_volume=value; else current.volume=value;
+        // Setting a level while muted unmutes, as in the Sonos app.
+        auto k=for_room(grouped()?"GroupVolume":"Volume"); k->value=value; k->unmute=muted_now(); send(k);
+        if(grouped()) { current.group_volume=value; current.group_muted=false; }
+        else { current.volume=value; current.muted=false; }
+        render_volume();
     }
 }
 lv_obj_t* volume_slider(lv_obj_t* parent,int width) {
@@ -300,16 +318,17 @@ void render_progress() {
     lv_label_set_text(np_elapsed,clock_text(position).c_str());
     lv_label_set_text(np_remaining,("-"+clock_text(current.duration-position)).c_str());
 }
+// The title is 36 px SemiBold on 40 px lines, at most two of them.
+int32_t title_line_space() { return 40-lv_font_get_line_height(&font_title_36); }
+int32_t title_max_height() { return 2*lv_font_get_line_height(&font_title_36)+title_line_space(); }
 void progress_tick(lv_timer_t*) { if(view==View::NowPlaying && !screen_off()) render_progress(); }
 void render_now_playing() {
     const bool playing_something=have_state && !current.title.empty();
     lv_label_set_text(np_title,playing_something?current.title.c_str():"Nothing playing");
     // LVGL only truncates with "..." at a fixed height: measure, then cap at two lines.
     lv_obj_set_height(np_title,LV_SIZE_CONTENT); lv_obj_update_layout(np_title);
-    const int32_t two_lines=2*lv_font_get_line_height(&font_title_56);
-    if(lv_obj_get_height(np_title)>two_lines) lv_obj_set_height(np_title,two_lines);
+    if(lv_obj_get_height(np_title)>title_max_height()) lv_obj_set_height(np_title,title_max_height());
     lv_label_set_text(np_artist,playing_something?current.artist.c_str():"");
-    lv_label_set_text(np_album,playing_something?current.album.c_str():"");
     lv_obj_set_flag(np_full,LV_OBJ_FLAG_HIDDEN,!playing_something);
     lv_obj_set_flag(np_empty,LV_OBJ_FLAG_HIDDEN,playing_something);
     lv_label_set_text(np_empty_title,selected.id.empty()?"No room selected":"Nothing playing");
@@ -319,15 +338,7 @@ void render_now_playing() {
     lv_obj_set_state(np_next,LV_STATE_DISABLED,!supports("Next"));
     lv_obj_set_state(np_prev,LV_STATE_DISABLED,!supports("Previous"));
     const bool group=grouped();
-    const int volume=group?current.group_volume:current.volume;
-    const bool muted=group?current.group_muted:current.muted;
-    const bool dragging=lv_obj_has_state(np_volume,LV_STATE_PRESSED) || (room_volume && lv_obj_has_state(room_volume,LV_STATE_PRESSED));
-    if(!dragging) {
-        lv_slider_set_value(np_volume,volume,LV_ANIM_OFF);
-        if(room_volume) lv_slider_set_value(room_volume,volume,LV_ANIM_OFF);
-        lv_label_set_text_fmt(np_volume_value,"%d",volume);
-    }
-    set_icon(np_mute,muted?LV_SYMBOL_MUTE:LV_SYMBOL_VOLUME_MAX);
+    render_volume();
     if(group) lv_label_set_text_fmt(np_volume_caption,"%s  Group volume · %u rooms",ICON_LINK,static_cast<unsigned>(group_of(selected).size()));
     lv_obj_set_flag(np_volume_caption,LV_OBJ_FLAG_HIDDEN,!group);
     render_progress();
@@ -342,20 +353,19 @@ void build_now_playing(lv_obj_t* v) {
     now_art.build(np_full,art_spec::now_side,art_spec::now_radius,LV_SYMBOL_AUDIO);
     lv_obj_align(now_art.frame,LV_ALIGN_LEFT_MID,PAD,0);
     const int x=PAD+480+56, width=CONTENT_W-x-PAD;
-    // Title (<=136) + artist/album (~84) + progress/times (40) + transport (128)
-    // + volume (96) + group caption (28) = 512, so the column overhangs the
-    // 480 px artwork by 24 px top and bottom rather than squeezing rows together.
-    auto info=column(np_full,0); lv_obj_set_size(info,width,528); lv_obj_align(info,LV_ALIGN_LEFT_MID,x,0);
-    lv_obj_set_flex_align(info,LV_FLEX_ALIGN_START,LV_FLEX_ALIGN_START,LV_FLEX_ALIGN_START);
-    np_title=text(info,&font_title_56,ink::text,"Nothing playing");
+    // Spread top to bottom over the artwork's 480 px: title and artist, progress,
+    // times, transport, volume. Worst case (two-line title, group caption)
+    // is 436 px, so nothing has to squeeze.
+    auto info=column(np_full,0); lv_obj_set_size(info,width,480); lv_obj_align(info,LV_ALIGN_LEFT_MID,x,0);
+    lv_obj_set_flex_align(info,LV_FLEX_ALIGN_SPACE_BETWEEN,LV_FLEX_ALIGN_START,LV_FLEX_ALIGN_START);
+    auto head=column(info,8); lv_obj_set_size(head,width,LV_SIZE_CONTENT);
+    np_title=text(head,&font_title_36,ink::text,"Nothing playing");
+    lv_obj_set_style_text_line_space(np_title,title_line_space(),0);
     lv_obj_set_width(np_title,width); lv_label_set_long_mode(np_title,LV_LABEL_LONG_DOT);
     lv_obj_set_height(np_title,LV_SIZE_CONTENT);  // clamped to two lines in render_now_playing
     // The top padding sits inside one_line's fixed height, so add it back or descenders clip.
-    np_artist=one_line(text(info,&font_body_32,ink::muted),width); lv_obj_set_style_pad_top(np_artist,8,0);
-    lv_obj_set_height(np_artist,lv_font_get_line_height(&font_body_32)+8);
-    np_album=one_line(text(info,&font_body_26,ink::faint),width); lv_obj_set_style_pad_top(np_album,4,0);
-    lv_obj_set_height(np_album,lv_font_get_line_height(&font_body_26)+4);
-    auto grow=div(info); lv_obj_set_flex_grow(grow,1);
+    np_artist=one_line(text(head,&font_body_36,ink::muted),width); lv_obj_set_style_pad_top(np_artist,8,0);
+    lv_obj_set_height(np_artist,lv_font_get_line_height(&font_body_36)+8);
     np_progress=lv_bar_create(info); lv_obj_set_size(np_progress,width,8);
     lv_obj_set_style_bg_color(np_progress,c(ink::raised),0); lv_obj_set_style_bg_opa(np_progress,LV_OPA_COVER,0);
     lv_obj_set_style_bg_color(np_progress,c(ink::text),LV_PART_INDICATOR);
@@ -367,13 +377,19 @@ void build_now_playing(lv_obj_t* v) {
     np_prev=icon_button(transport,LV_SYMBOL_PREV,104,false,transport_clicked,(void*)"Previous");
     np_play=icon_button(transport,LV_SYMBOL_PLAY,128,true,transport_clicked,(void*)"Toggle");
     np_next=icon_button(transport,LV_SYMBOL_NEXT,104,false,transport_clicked,(void*)"Next");
-    auto volume=row(info,24); lv_obj_set_size(volume,width,TARGET); lv_obj_set_style_margin_top(volume,8,0);
-    np_mute=icon_button(volume,LV_SYMBOL_VOLUME_MAX,TARGET,false,mute_clicked);
-    np_volume=volume_slider(volume,width-TARGET-72-2*24);
-    np_volume_value=text(volume,&font_body_32,ink::text,"0"); lv_obj_set_width(np_volume_value,72);
+    // Volume and its group caption move as one block in the spread.
+    auto volume_block=column(info,0); lv_obj_set_size(volume_block,width,LV_SIZE_CONTENT);
+    auto volume=row(volume_block,24); lv_obj_set_size(volume,width,96); lv_obj_set_style_pad_top(volume,8,0);
+    // A small 56 px mute button, its touch area widened to the 88 px minimum.
+    constexpr int MUTE=56, VALUE_W=60;
+    np_mute=icon_button(volume,LV_SYMBOL_VOLUME_MAX,MUTE,false,mute_clicked);
+    lv_obj_set_style_text_font(lv_obj_get_child(np_mute,0),&font_body_26,0);
+    lv_obj_set_ext_click_area(np_mute,(TARGET-MUTE)/2);
+    np_volume=volume_slider(volume,width-MUTE-VALUE_W-2*24);
+    np_volume_value=text(volume,&font_caption_22,ink::text,"0"); lv_obj_set_width(np_volume_value,VALUE_W);
     lv_obj_set_style_text_align(np_volume_value,LV_TEXT_ALIGN_RIGHT,0);
-    np_volume_caption=text(info,&font_caption_22,ink::faint,"Volume");
-    lv_obj_set_style_pad_left(np_volume_caption,TARGET+24,0);
+    np_volume_caption=text(volume_block,&font_caption_22,ink::faint,"Volume");
+    lv_obj_set_style_pad_left(np_volume_caption,MUTE+24,0);
     lv_timer_create(progress_tick,1000,nullptr);
 }
 
@@ -574,7 +590,7 @@ void render_rooms() {
             lv_obj_align(detail,LV_ALIGN_TOP_LEFT,0,52);
             room_volume=volume_slider(card,card_w-48);
             lv_obj_align(room_volume,LV_ALIGN_BOTTOM_LEFT,0,0);
-            lv_slider_set_value(room_volume,grouped()?current.group_volume:current.volume,LV_ANIM_OFF);
+            lv_slider_set_value(room_volume,shown_volume(),LV_ANIM_OFF);
         } else {
             lv_obj_align(detail,LV_ALIGN_BOTTOM_LEFT,0,0);
             if(mates) {
@@ -727,17 +743,17 @@ void build_settings(lv_obj_t* v) {
 void toast_hide(lv_timer_t* t) { lv_obj_add_flag(toast,LV_OBJ_FLAG_HIDDEN); lv_timer_pause(t); }
 void build_rail(lv_obj_t* screen) {
     auto rail=div(screen); lv_obj_set_size(rail,RAIL,H);
-    lv_obj_set_style_bg_opa(rail,LV_OPA_COVER,0); lv_obj_set_style_bg_color(rail,c(ink::rail),0);
-    lv_obj_set_flex_flow(rail,LV_FLEX_FLOW_COLUMN); lv_obj_set_style_pad_top(rail,16,0); lv_obj_set_style_pad_row(rail,4,0);
+    lv_obj_set_style_bg_opa(rail,LV_OPA_COVER,0); lv_obj_set_style_bg_color(rail,c(ink::surface),0);
+    lv_obj_set_flex_flow(rail,LV_FLEX_FLOW_COLUMN); lv_obj_set_style_pad_row(rail,4,0);
     struct Item { const char* icon; const char* label; } items[5]={
         {LV_SYMBOL_AUDIO,"Playing"},{ICON_STAR,"Favorites"},{LV_SYMBOL_LIST,"Queue"},{LV_SYMBOL_HOME,"Rooms"},{LV_SYMBOL_SETTINGS,"Settings"}};
     for(int i=0;i<5;++i) {
         if(i==4) { auto grow=div(rail); lv_obj_set_flex_grow(grow,1); }
         auto b=tappable(rail,RAIL,112,ink::surface,ink::pressed,0,nav_clicked,reinterpret_cast<void*>(static_cast<uintptr_t>(i)));
-        lv_obj_set_style_bg_opa(b,LV_OPA_TRANSP,0);
+        lv_obj_set_style_bg_color(b,c(ink::accent),0); lv_obj_set_style_bg_opa(b,LV_OPA_TRANSP,0);
         lv_obj_set_flex_flow(b,LV_FLEX_FLOW_COLUMN);
         lv_obj_set_flex_align(b,LV_FLEX_ALIGN_CENTER,LV_FLEX_ALIGN_CENTER,LV_FLEX_ALIGN_CENTER);
-        lv_obj_set_style_pad_row(b,6,0);
+        lv_obj_set_style_pad_row(b,10,0);
         text(b,&font_body_32,ink::muted,items[i].icon);
         text(b,&font_caption_22,ink::muted,items[i].label);
         rail_items[i]=b;
