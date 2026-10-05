@@ -35,6 +35,22 @@ config TAB5_DIM_PERCENT
     default 15
     range 1 100
 
+config TAB5_DEFAULT_ROOM
+    string "Room selected at startup"
+    default ""
+    help
+        The room name exactly as the Sonos app shows it, for example
+        "Kitchen". Empty, or not found, selects the first room.
+
+config TAB5_START_VOLUME
+    int "Volume for a favorite started in the startup room while it is idle"
+    default 0
+    range 0 100
+    help
+        Tapping a favorite while TAB5_DEFAULT_ROOM is not playing sets that
+        room to this volume before playback starts. Music already playing
+        is never changed. 0 leaves the volume alone.
+
 config TAB5_SETTINGS_PASSCODE
     string "Passcode for changing Wi-Fi settings (four digits)"
     default "1234"

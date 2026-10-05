@@ -826,7 +826,10 @@ void ui_rooms(const std::vector<sonos::Room>& fresh) {
     rooms=fresh;
     auto it=std::find_if(rooms.begin(),rooms.end(),[&](const sonos::Room& r){ return r.id==selected.id; });
     if(it!=rooms.end()) selected=*it;
-    else if(!rooms.empty()) { selected=rooms.front(); have_state=false; current={}; }
+    else if(!rooms.empty()) {  // first load, or the selected room is gone: the startup room, else the first
+        auto preferred=std::find_if(rooms.begin(),rooms.end(),[](const sonos::Room& r){ return r.name==CONFIG_TAB5_DEFAULT_ROOM; });
+        selected=preferred!=rooms.end()?*preferred:rooms.front(); have_state=false; current={};
+    }
     else selected={};
     render_rooms(); render_now_playing();
 }

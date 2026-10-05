@@ -12,6 +12,7 @@ Implemented:
 
 - Favorites screen restricted to Apple Music and Sonos Radio using service IDs supplied by the household; unknown/conflicting providers are excluded.
 - Room selection on the Rooms tab (the selected card carries its volume slider), now-playing text, play/pause/stop, capability-gated previous/next, room mute, room and group volume. Grouping is left to the Sonos app; the controller follows whatever groups exist.
+- Optional startup room and starting volume: `CONFIG_TAB5_DEFAULT_ROOM` (e.g. `Kitchen`) is selected at boot, and `CONFIG_TAB5_START_VOLUME` sets that room's level when a favorite is started there while it is idle. Both live in menuconfig under "Tab5 screen"; set them in `firmware/sdkconfig`.
 - Speaker discovery by SSDP and mDNS together, remembered room IPs as a fallback, and an optional manual speaker IP.
 - On-device Wi-Fi setup and persistent settings. Changing a saved network asks for a four-digit passcode, `CONFIG_TAB5_SETTINGS_PASSCODE` in menuconfig (default `1234`; set your own in `firmware/sdkconfig`).
 - Network work on a separate FreeRTOS task, bounded XML responses and paginated favorites, periodic state refresh, fresh coordinator lookup before group playback actions.

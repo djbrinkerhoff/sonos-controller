@@ -69,6 +69,13 @@ void push_rooms(const std::vector<sonos::Room>& all) {
     if(!same_rooms(all,published)) { published=all; ui_rooms(all); }
 }
 
+// Starting a favorite in the startup room from silence uses a set level
+// (CONFIG_TAB5_START_VOLUME); never change the volume under music already playing.
+void apply_start_volume(const sonos::Room& room) {
+    if(CONFIG_TAB5_START_VOLUME<=0 || room.name!=CONFIG_TAB5_DEFAULT_ROOM) return;
+    if(client.summary(client.coordinator(room)).playback=="PLAYING") return;
+    client.volume(room,CONFIG_TAB5_START_VOLUME);
+}
 void save_settings(const Command& command) {
     nvs_handle_t handle;
     if(nvs_open("controller",NVS_READWRITE,&handle)!=ESP_OK) throw std::runtime_error("Cannot save Wi-Fi settings");
@@ -289,7 +296,7 @@ void worker(void*) {
                     refresh(); catalog_due=false; last_catalog_check=xTaskGetTickCount();
                     ui_toast("Connected"); ui_show(View::NowPlaying);
                 } else if(a=="Refresh") { refresh(); catalog_due=false; last_catalog_check=xTaskGetTickCount(); }
-                else if(a=="Favorite") client.play_favorite(c->room,c->favorite);
+                else if(a=="Favorite") { apply_start_volume(c->room); client.play_favorite(c->room,c->favorite); }
                 else if(a=="TileArt") {
                     // Verify the index and id together; the list may have been
                     // reloaded since the UI asked.
