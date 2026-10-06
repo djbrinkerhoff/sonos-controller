@@ -825,6 +825,9 @@ void build_rail(lv_obj_t* screen) {
         lv_obj_set_flex_flow(b,LV_FLEX_FLOW_COLUMN);
         lv_obj_set_flex_align(b,LV_FLEX_ALIGN_CENTER,LV_FLEX_ALIGN_CENTER,LV_FLEX_ALIGN_CENTER);
         lv_obj_set_style_pad_row(b,10,0);
+        // Cover the rail's 4 px gaps: a tap between two tabs hit the rail
+        // itself and did nothing (seen in the /touch trace).
+        lv_obj_set_ext_click_area(b,2);
         text(b,&font_body_32,ink::muted,items[i].icon);
         text(b,&font_caption_22,ink::muted,items[i].label);
         rail_items[i]=b;

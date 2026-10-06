@@ -84,6 +84,20 @@ esp_err_t screenshot(httpd_req_t* request) {
 
 // What the panel actually shows: the DPI framebuffer, rotated back to landscape.
 // /screenshot renders LVGL's widgets instead, so it cannot catch flush bugs.
+esp_err_t touch(httpd_req_t* request) {
+    bsp_display_lock(0); const std::string text=touch_trace(); bsp_display_unlock();
+    httpd_resp_set_type(request,"text/plain");
+    return httpd_resp_send(request,text.data(),text.size());
+}
+// /crash?now=1 aborts on purpose, to check that the next boot reports it (crash.cpp).
+esp_err_t crash_now(httpd_req_t* request) {
+    char query[16]{}, value[4]{};
+    if(httpd_req_get_url_query_str(request,query,sizeof query)!=ESP_OK || httpd_query_key_value(query,"now",value,sizeof value)!=ESP_OK || strcmp(value,"1"))
+        return httpd_resp_send_err(request,HTTPD_400_BAD_REQUEST,"use /crash?now=1 (restarts the device)");
+    httpd_resp_sendstr(request,"aborting");
+    vTaskDelay(pdMS_TO_TICKS(200));
+    abort();
+}
 // /ppa?cpu=1 switches the display to CPU rotation, the path a wedged PPA
 // falls back to, so it can be checked without waiting for the driver race.
 esp_err_t ppa_mode(httpd_req_t* request) {
@@ -199,6 +213,7 @@ esp_err_t perf(httpd_req_t* request) {
              static_cast<int>(lv_area_get_width(&band)),static_cast<int>(lv_area_get_height(&band)),static_cast<int>(band.y1)); out+=line;
     snprintf(line,sizeof line,"internal DMA heap free %u KB, largest block %u KB, lost PPA completions %u\n",static_cast<unsigned>(dma_free/1024),
              static_cast<unsigned>(dma_block/1024),static_cast<unsigned>(fast_flush_lost_completions())); out+=line;
+    snprintf(line,sizeof line,"touch releases caught by polling %u\n",static_cast<unsigned>(touch_releases_polled())); out+=line;
     snprintf(line,sizeof line,"PSRAM free %u KB of %u KB, low-water %u KB, largest block %u KB\n",
              static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)/1024),static_cast<unsigned>(heap_caps_get_total_size(MALLOC_CAP_SPIRAM)/1024),
              static_cast<unsigned>(heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM)/1024),static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)/1024)); out+=line;
@@ -367,6 +382,10 @@ void debug_register(httpd_handle_t server) {
     httpd_register_uri_handler(server,&panel_uri);
     static const httpd_uri_t ppa_uri{.uri="/ppa",.method=HTTP_GET,.handler=ppa_mode,.user_ctx=nullptr};
     httpd_register_uri_handler(server,&ppa_uri);
+    static const httpd_uri_t crash_uri{.uri="/crash",.method=HTTP_GET,.handler=crash_now,.user_ctx=nullptr};
+    httpd_register_uri_handler(server,&crash_uri);
+    static const httpd_uri_t touch_uri{.uri="/touch",.method=HTTP_GET,.handler=touch,.user_ctx=nullptr};
+    httpd_register_uri_handler(server,&touch_uri);
     static const httpd_uri_t power_uri{.uri="/power",.method=HTTP_GET,.handler=power,.user_ctx=nullptr};
     httpd_register_uri_handler(server,&power_uri);
     httpd_register_uri_handler(server,&drag_uri);

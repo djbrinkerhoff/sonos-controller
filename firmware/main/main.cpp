@@ -8,6 +8,7 @@
 #include "fast_flush.hpp"
 #include "display_power.hpp"
 #include "esp_pm.h"
+#include "crash.hpp"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "events.hpp"
@@ -606,6 +607,7 @@ extern "C" void app_main() {
 #endif
     ota_log_boot();
     ESP_LOGI(TAG,"Reset reason %d",static_cast<int>(esp_reset_reason()));
+    crash_report();
     await_touch_controller();
     // Measured: a full-screen PSRAM draw buffer (one band) renders Favorites in
     // ~154 ms versus ~69 ms for the BSP's 50-line bands in internal RAM, so the
@@ -623,6 +625,7 @@ extern "C" void app_main() {
     display_power_init(display);
     ui_build();
     screen_init(screen_woke);
+    touch_guard_init(bsp_display_get_input_dev());
     bsp_display_unlock();
     // Full speed while the panel driver holds its lock (screen on); 40 MHz
     // once display_sleep() deletes the driver. Measured: 9 mA at the pack.

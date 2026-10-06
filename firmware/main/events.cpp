@@ -230,7 +230,7 @@ void events_start(void (*on_event)(const char*)) {
     httpd_config_t config=HTTPD_DEFAULT_CONFIG();
     config.server_port=PORT;
     config.uri_match_fn=httpd_uri_match_wildcard;
-    config.max_uri_handlers=16; // /notify/* plus headroom for OTA and debug handlers
+    config.max_uri_handlers=20; // /notify/* plus headroom for OTA and debug handlers
     config.lru_purge_enable=true;
     // OTA flash writes and screenshot encoding run in this task; the 4 KB
     // default overflowed during the first OTA upload on hardware.

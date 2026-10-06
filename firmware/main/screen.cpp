@@ -59,7 +59,57 @@ void tick(lv_timer_t*) {
     else set_level(Level::Deep);
 }
 void shield_released(lv_event_t*) { lv_obj_add_flag(shield,LV_OBJ_FLAG_HIDDEN); }
+lv_indev_t* touch_indev=nullptr;
+std::atomic<uint32_t> releases_polled{0};
+// Trace of panel reads and LVGL input events, for /touch (LVGL task only).
+struct TraceEntry { uint32_t ms; char kind; uint8_t state; int16_t x,y; const void* obj; };
+constexpr int TRACE_LEN=96;
+TraceEntry trace[TRACE_LEN]; int trace_head=0, trace_count=0;
+bool polling=false;
+lv_indev_read_cb_t panel_read=nullptr;
+void note(char kind,uint8_t state,int16_t x,int16_t y,const void* obj) {
+    trace[trace_head]={lv_tick_get(),kind,state,x,y,obj};
+    trace_head=(trace_head+1)%TRACE_LEN; if(trace_count<TRACE_LEN) ++trace_count;
 }
+void traced_read(lv_indev_t* indev,lv_indev_data_t* data) {
+    panel_read(indev,data);
+    note(polling?'p':'i',data->state==LV_INDEV_STATE_PRESSED,data->point.x,data->point.y,nullptr);
+}
+void input_event(lv_event_t* e) {
+    const auto code=lv_event_get_code(e);
+    char kind=code==LV_EVENT_PRESSED?'P':code==LV_EVENT_RELEASED?'R':code==LV_EVENT_CLICKED?'C':
+              code==LV_EVENT_PRESS_LOST?'L':code==LV_EVENT_SCROLL_BEGIN?'S':code==LV_EVENT_LONG_PRESSED?'G':0;
+    if(kind) note(kind,0,0,0,lv_indev_get_active_obj());
+}
+void touch_guard(lv_timer_t*) {
+    if(!touch_indev || lv_indev_get_state(touch_indev)!=LV_INDEV_STATE_PRESSED) return;
+    polling=true; lv_indev_read(touch_indev); polling=false;
+    if(lv_indev_get_state(touch_indev)==LV_INDEV_STATE_RELEASED) releases_polled.fetch_add(1);
+}
+}
+void touch_guard_init(lv_indev_t* touch) {
+    touch_indev=touch;
+    if(!touch) return;
+    panel_read=lv_indev_get_read_cb(touch);
+    if(panel_read) lv_indev_set_read_cb(touch,traced_read);
+    lv_indev_add_event_cb(touch,input_event,LV_EVENT_ALL,nullptr);
+    if(lv_indev_get_mode(touch)==LV_INDEV_MODE_EVENT) lv_timer_create(touch_guard,15,nullptr);
+}
+std::string touch_trace() {
+    // i/p: panel read on the interrupt / by polling (1 = pressed); P R C L S G:
+    // pressed, released, clicked, press lost, scroll began, long press.
+    std::string out; char line[64];
+    const int start=(trace_head-trace_count+TRACE_LEN)%TRACE_LEN;
+    const uint32_t t0=trace_count?trace[start].ms:0;
+    for(int i=0;i<trace_count;++i) {
+        const auto& t=trace[(start+i)%TRACE_LEN];
+        if(t.kind=='i' || t.kind=='p') snprintf(line,sizeof line,"%7lu %c %d (%d,%d)\n",static_cast<unsigned long>(t.ms-t0),t.kind,t.state,t.x,t.y);
+        else snprintf(line,sizeof line,"%7lu   %c obj %p\n",static_cast<unsigned long>(t.ms-t0),t.kind,t.obj);
+        out+=line;
+    }
+    return out;
+}
+uint32_t touch_releases_polled() { return releases_polled.load(); }
 
 void screen_init(void (*on_wake)()) {
     wake_callback=on_wake;
