@@ -67,3 +67,12 @@ CONFIG_PM_ENABLE=y
 # A task that starves the idle tasks for 5 s restarts the device instead of
 # leaving it frozen (measured case: a DSI read that never returns).
 CONFIG_ESP_TASK_WDT_PANIC=y
+
+# October 2026 performance pass (measured with /perf; see HANDOFF).
+# Fast misaligned memcpy/memmove in the C library (default from IDF 6.0), so
+# LVGL can use it: views render 2-5% faster than with LVGL's own lv_memcpy.
+CONFIG_LIBC_OPTIMIZED_MISALIGNED_ACCESS=y
+CONFIG_LV_USE_CLIB_STRING=y
+# 1 ms ticks: input and refresh timing no longer round to 10 ms (taps land
+# 8-10 ms sooner), and pdMS_TO_TICKS waits mean what they say.
+CONFIG_FREERTOS_HZ=1000

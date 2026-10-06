@@ -32,6 +32,23 @@ The details are in the session sections below. These are the rules they add up t
 - `CHG_STAT` reads high on battery too. The BSP's Wi-Fi power-on resets the charger pins (fixed in `power_init()`). The C6 costs 16 mA even with its radio stopped, but powering it off needs a restart to recover esp_hosted.
 - Multicast SSDP is unreliable on this mesh; mDNS (link-local) is not.
 
+## October 2026: performance research pass
+
+Community and Espressif sources were checked against this firmware; the measured results, from a fresh boot each time (Favorites scroll average, view render, tap to finished view):
+
+| Change | Scroll | Playing / Rooms / Queue render | Tap to view | Kept |
+|---|---|---|---|---|
+| Baseline | 20.5-22.7 ms | 34.0 / 26.1 / 18.1 ms | 89-103 ms | |
+| IDF PPA fix (below) | 20.6 | 34.3 / 26.1 / 18.1 | 89-105 | yes |
+| `LIBC_OPTIMIZED_MISALIGNED_ACCESS` + `LV_USE_CLIB_STRING` | 19.5 | 32.9 / 25.3 / 17.5 | 88-103 | yes |
+| `FREERTOS_HZ` 1000 | 19.3 | 34.5 / 27.7 / 17.7 | 80-95 | yes |
+| TCP window 23040 + mailbox 16 + `SPIRAM_TRY_ALLOCATE_WIFI_LWIP` | | | | **no**: no covers loaded, internal DMA heap fell to 4 KB free (1 KB block) |
+
+- **PPA stall root cause:** IDF's DIG-734 workaround in `ppa_srm.c` sized the leftover block from the *unrotated* width/height, so 90-degree rotations into the scanned-out framebuffer could stop completing (esp-idf #19096/#19023; every hang had `block_offset_x % 4 == 2`). Fixed upstream in 469aa16 (master, not yet in a 5.5 release). `tools/patches/esp-idf-v5.5.3-ppa-srm-rotation.patch` backports it and `bootstrap.sh` applies it. The `fast_flush` CPU fallback stays as a safety net.
+- `LV_USE_CLIB_STRING` was rejected in session 8 because the ROM C library is 6x slower on misaligned copies; the libc option fixes that, and the combination now beats LVGL's own copy.
+- The 1000 Hz tick runs without tickless idle; its screen-off power cost is still to be measured on battery.
+- Still open from the research: code from PSRAM (`SPIRAM_XIP_FROM_PSRAM`) or QIO flash, a lower DPI clock to free PSRAM bandwidth (needs eyes for flicker), panel sleep with 120 ms after SLPOUT, a smaller TCP window raise without moving lwIP, newer esp_hosted (C6 power-off without restart; needs C6 firmware), LVGL 9.6.
+
 ## Session 9: battery life
 
 Measured on battery with the INA226 through a new `/power` endpoint (mean pack current, discharge positive, back-to-back 141 ms shunt averages). On USB power the pack current reads 0 even with charging disabled: the system then runs from USB, so battery work needs the cable unplugged.

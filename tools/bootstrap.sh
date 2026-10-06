@@ -12,6 +12,14 @@ if [[ "$(git -C .tools/esp-idf rev-parse HEAD)" != "2c211b236707889e8400c4dc5644
   echo "Expected ESP-IDF v5.5.3; existing toolchain was left unchanged." >&2
   exit 1
 fi
+# Local fixes to ESP-IDF itself, until they ship in a release; each is
+# applied once (a patch that already reverses cleanly is in place).
+for patch in tools/patches/esp-idf-v5.5.3-*.patch; do
+  [[ -e "$patch" ]] || continue
+  if git -C .tools/esp-idf apply --reverse --check "$project_root/$patch" 2>/dev/null; then continue; fi
+  git -C .tools/esp-idf apply "$project_root/$patch"
+  echo "Applied $patch"
+done
 .tools/esp-idf/install.sh esp32p4
 for candidate in "$IDF_TOOLS_PATH"/python_env/idf5.5_py*_env; do
   if [[ -x "$candidate/bin/python" ]]; then
